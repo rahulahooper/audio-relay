@@ -1,5 +1,6 @@
 /* BSD Socket API Example
 
+
    This example code is in the Public Domain (or CC0 licensed, at your option.)
 
    Unless required by applicable law or agreed to in writing, this
@@ -37,7 +38,15 @@
 #define EXAMPLE_ESP_WIFI_CHANNEL    1
 #define EXAMPLE_MAX_STA_CONN        5
 
-#define PAYLOAD_LEN 996
+#define WIFI_STATION_CONNECT_MAXIMUM_RETRIES  10
+#define WIFI_EVENT_AP_STACONNECTED_BIT        BIT0     // a wifi station connected to this device
+#define WIFI_EVENT_AP_STADISCONNECTED_BIT     BIT1     // a wifi station disconnected from this device
+#define IP_EVENT_STA_GOT_IP_BIT               BIT2     // this device connected to a wifi access point
+#define WIFI_EVENT_STA_FAILED_BIT             BIT3     // this device failed to connect to a wifi access point
+
+#define ESP_CORE_0      0       // physical core 0
+#define ESP_CORE_1      1       // physical core 1
+#define PAYLOAD_MAX_LEN 996
 
 typedef enum State_t
 {
@@ -50,12 +59,20 @@ typedef enum State_t
 
 static State_t gState;     // global state object
 
-struct AudioPacket_t
+typedef struct AudioPacket_t
 {
     uint16_t seqnum;
-    uint8_t  payload[PAYLOAD_LEN];
+    bool     echo;                  // client requested an echo from server
     uint16_t checksum;              // crc-16
-};
+    uint16_t payloadSize;
+    uint8_t  payload[PAYLOAD_MAX_LEN];
+} AudioPacket_t;
+
+typedef struct ResponsePacket_t
+{
+    uint16_t seqnum;
+    char     response[5];   // large enough to hold the "NACK" string
+} ResponsePacket_t;
 
 struct IPPacket_t
 {
@@ -67,15 +84,23 @@ static const char *TAG = "wifi_ap";
 
 /* FreeRTOS event group to signal when a client is connected or disconnected */
 static EventGroupHandle_t s_wifi_event_group;
-static uint32_t s_wifi_station_retry_num = 0;       // number of retries attempting to connect to access point
+static uint32_t s_wifi_station_retry_num = 0;      // number of retries attempting to connect to access point (home network)
 
-#define WIFI_STATION_CONNECT_MAXIMUM_RETRIES  10
+static AudioPacket_t gAudioPackets[2];
+static AudioPacket_t * activePacket;               // transmitting task transmits this packet
+static AudioPacket_t * backgroundPacket;           // sampling task fills this packet
 
-#define WIFI_EVENT_AP_STACONNECTED_BIT     BIT0     // a wifi station connected to this device
-#define WIFI_EVENT_AP_STADISCONNECTED_BIT  BIT1     // a wifi station disconnected from this device
-#define IP_EVENT_STA_GOT_IP_BIT            BIT2     // this device connected to a wifi access point
-#define WIFI_EVENT_STA_FAILED_BIT          BIT3     // this device failed to connect to a wifi access point
+static const UBaseType_t playbackDoneNotifyIndex = 0;      // set by the playback task when it is done processing audio data
+static const UBaseType_t dataReadyNotifyIndex;             // set by the receive task when there is new data available for the playback task
 
+static TaskHandle_t receiveTaskHandle = NULL;
+static TaskHandle_t playbackTaskHandle = NULL;
+
+
+////////////////////////////////////////////////////////////////////
+// wifi_setup_driver()
+//
+////////////////////////////////////////////////////////////////////
 esp_err_t wifi_setup_driver(wifi_init_config_t* cfg)
 {
     ESP_LOGI(TAG, "%s: Setting up WiFi driver\n", __func__);        
@@ -90,6 +115,11 @@ esp_err_t wifi_setup_driver(wifi_init_config_t* cfg)
     return ESP_OK;
 }
 
+
+////////////////////////////////////////////////////////////////////
+// wifi_event_handler()
+//
+////////////////////////////////////////////////////////////////////
 static void wifi_event_handler(void* arg, esp_event_base_t event_base,
                                     int32_t event_id, void* event_data)
 {
@@ -156,6 +186,11 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
     }
 }
 
+
+////////////////////////////////////////////////////////////////////
+// wifi_station_start_and_connect()
+//
+////////////////////////////////////////////////////////////////////
 esp_err_t wifi_station_start_and_connect(wifi_config_t* wifi_config, bool* error)
 {
     *error = true;
@@ -211,6 +246,11 @@ esp_err_t wifi_station_start_and_connect(wifi_config_t* wifi_config, bool* error
     return ESP_OK;
 }
 
+
+////////////////////////////////////////////////////////////////////
+// wifi_station_disconnect_and_stop()
+//
+////////////////////////////////////////////////////////////////////
 esp_err_t wifi_station_disconnect_and_stop()
 {
     // Stop subscribing to station-related callbacks
@@ -245,6 +285,11 @@ esp_err_t wifi_station_disconnect_and_stop()
     return ret;
 }
 
+
+////////////////////////////////////////////////////////////////////
+// set_system_time()
+//
+////////////////////////////////////////////////////////////////////
 esp_err_t set_system_time(wifi_config_t* wifi_config, bool* error)
 {
     // connect to sntp server
@@ -255,6 +300,7 @@ esp_err_t set_system_time(wifi_config_t* wifi_config, bool* error)
     esp_sntp_config_t config = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
     config.start = false;   // wait for Wifi connection before starting SNTP service
     config.server_from_dhcp = true;     // use DHCP server to get SNTP IP address
+    config.smooth_sync = true;          // gradually reduce time error
     ESP_ERROR_CHECK(esp_netif_sntp_init(&config));
 
     ESP_LOGI(TAG, "%s Starting SNTP client\n", __func__);
@@ -262,12 +308,21 @@ esp_err_t set_system_time(wifi_config_t* wifi_config, bool* error)
 
     time_t now = 0;
     struct tm timeinfo = { 0 };
-    if (esp_netif_sntp_sync_wait(pdMS_TO_TICKS(10000)) != ESP_OK)
+    esp_err_t ret = esp_netif_sntp_sync_wait(pdMS_TO_TICKS(10000));
+    if (ret != ESP_OK)
     {
-        ESP_LOGE(TAG, "Failed to update system time within 10s timeout!\n");
+        ESP_LOGE(TAG, "%s: Failed to update system time within 10s timeout! error: %s\n", __func__, esp_err_to_name(ret));
         *error = true;
         return ESP_OK;
     }
+
+    int i = 0;
+    while (sntp_get_sync_status() == SNTP_SYNC_STATUS_IN_PROGRESS)
+    {
+       i++;
+    }
+
+    ESP_LOGI(TAG, "%s: took %d iterations to finish syncing\n" , __func__, i);
 
     time(&now);
     localtime_r(&now, &timeinfo);
@@ -287,6 +342,25 @@ esp_err_t set_system_time(wifi_config_t* wifi_config, bool* error)
     return ESP_OK;
 }
 
+
+////////////////////////////////////////////////////////////////////
+// get_system_time()
+//
+////////////////////////////////////////////////////////////////////
+esp_err_t get_system_time(int64_t* time_us)
+{
+    struct timeval tv_now;
+    gettimeofday(&tv_now, NULL);
+    *time_us = (int64_t)tv_now.tv_sec * 1000000L + (int64_t)tv_now.tv_usec;
+    
+    return ESP_OK;
+}
+
+
+////////////////////////////////////////////////////////////////////
+// _wifi_softap_start()
+//
+////////////////////////////////////////////////////////////////////
 esp_err_t _wifi_softap_start()
 {
     // esp_netif_create_default_wifi_ap();
@@ -359,7 +433,12 @@ uint16_t crc16(uint8_t* data, uint32_t len)
     return crc;
 }
 
-esp_err_t setupServer(int addr_family, struct sockaddr_in* dest_addr, int* sockFd)
+
+////////////////////////////////////////////////////////////////////
+// setup_server()
+//
+////////////////////////////////////////////////////////////////////
+esp_err_t setup_server(int addr_family, struct sockaddr_in* dest_addr, int* sockFd)
 {
 
     ESP_ERROR_CHECK(_wifi_softap_start());
@@ -400,7 +479,7 @@ esp_err_t setupServer(int addr_family, struct sockaddr_in* dest_addr, int* sockF
 
     // Set timeout
     struct timeval timeout;
-    timeout.tv_sec = 10;
+    timeout.tv_sec = 3;
     timeout.tv_usec = 0;
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout);
 
@@ -416,69 +495,125 @@ esp_err_t setupServer(int addr_family, struct sockaddr_in* dest_addr, int* sockF
     return ESP_OK;
 }
 
-esp_err_t streamFromClient(const int sock)
+
+////////////////////////////////////////////////////////////////////
+// stream_from_client()
+//
+////////////////////////////////////////////////////////////////////
+esp_err_t stream_from_client(const int sock)
 {
     struct sockaddr_storage client_addr;
     socklen_t sockaddr_len = sizeof(client_addr);
-    struct AudioPacket_t dummyPacket;
-    bool alreadyConnected = false;
+    struct AudioPacket_t recvPacket;
+    bool isFirstPacket = true;
 
     char client_addr_str[128];
     memset(client_addr_str, 0, sizeof(client_addr_str));
 
-    while (true)
+    while (playbackTaskHandle == NULL)
     {
-        // receive packet
-        int len = recvfrom(sock, &dummyPacket, sizeof(dummyPacket), 0, (struct sockaddr*)&client_addr, &sockaddr_len);
-
-        if (len < 0)
-        {
-            ESP_LOGE(TAG, "recvfrom failed: errno %d (%s)", errno, strerror(errno));
-            break;
-        }    
-        
-        if (!alreadyConnected)
-        {
-            alreadyConnected = true;
-
-            // We found a new client, print out the IP address
-            inet_ntoa_r(((struct sockaddr_in *)&client_addr)->sin_addr, client_addr_str, sizeof(client_addr_str) - 1);
-            client_addr_str[sizeof(client_addr_str)-1] = 0;
-
-            ESP_LOGI(TAG, "%s Connected to client with IP address %s\n", __func__, client_addr_str);
-        }
-
-        // validate packet
-        uint16_t checksum = crc16(dummyPacket.payload, PAYLOAD_LEN);
-
-        const char* message;
-        if (checksum != dummyPacket.checksum)
-        {
-            ESP_LOGE(TAG, "%s: Invalid checksum. Got 0x%x, expected 0x%x\n", __func__, checksum, dummyPacket.checksum);
-            message = "NACK";
-        }
-        else
-        {
-            ESP_LOGI(TAG, "%s: Successfully received packet with checksum 0x%x, seqnum %u\n", __func__, checksum, dummyPacket.seqnum);
-            message = "ACK";
-        }
-
-        int err = sendto(sock, message, strlen(message), 0, (struct sockaddr*)&client_addr, sockaddr_len);
-        if (err < 0)
-        {
-            ESP_LOGE(TAG, "%s: Error sending sending response (%s) to client at address %s\n", __func__, message, client_addr_str);
-        }
+        ESP_LOGI(TAG, "%s Waiting for playback task to come up\n", __func__);
+        vTaskDelay(pdMS_TO_TICKS(500));
     }
 
-    // We should only break out of here if the client got disconnected
+    bool error = false;
+    while (!error)
+    {
+
+        // Keep receiving data into the background buffer until the playback task
+        // signals that it is ready for new data
+        while(!ulTaskNotifyTakeIndexed(playbackDoneNotifyIndex, pdTRUE, 0))
+        {
+            // receive packet
+            int len = recvfrom(sock, &recvPacket, sizeof(recvPacket), 0, (struct sockaddr*)&client_addr, &sockaddr_len);
+
+            if (len < 0)
+            {
+                ESP_LOGE(TAG, "recvfrom failed: errno %d (%s)", errno, strerror(errno));
+                error = true;
+                break;
+            }    
+        
+            // Cache the client IP address in case we want to echo back a packet
+            // TODO: Can we get the IP address in wait_for_client()?
+            if (isFirstPacket)
+            {
+                isFirstPacket = false;
+
+                // We found a new client, print out the IP address
+                inet_ntoa_r(((struct sockaddr_in *)&client_addr)->sin_addr, client_addr_str, sizeof(client_addr_str) - 1);
+                client_addr_str[sizeof(client_addr_str)-1] = 0;
+
+                ESP_LOGI(TAG, "%s Connected to client with IP address %s\n", __func__, client_addr_str);
+            }
+
+            int64_t timerecv;
+            get_system_time(&timerecv);
+
+            // validate packet
+            uint16_t checksum = crc16(recvPacket.payload, recvPacket.payloadSize);
+
+            if (checksum != recvPacket.checksum)
+            {
+                ESP_LOGE(TAG, "%s: Invalid checksum. Got 0x%x, expected 0x%x\n", __func__, checksum, recvPacket.checksum);
+                continue;
+            }
+
+            ESP_LOGI(TAG, "%s: Successfully received packet with checksum 0x%x, seqnum %u, payload size %u\n", 
+                __func__, checksum, recvPacket.seqnum, recvPacket.payloadSize);
+
+            // Copy into background buffer
+            if (recvPacket.payloadSize + backgroundPacket->payloadSize >= PAYLOAD_MAX_LEN)
+            {
+                // This shouldn't technically be possible since the client and server are
+                // processing audio data at the same rate
+                ESP_LOGI(TAG, "%s background buffer would overflow. Clearing buffer.\n", __func__);
+                backgroundPacket->payloadSize = 0;
+            }
+            memcpy(&backgroundPacket->payload[backgroundPacket->payloadSize], recvPacket.payload, recvPacket.payloadSize);
+
+            // echo the packet
+            if (recvPacket.echo)
+            {
+
+                int err = sendto(sock, (void*)&recvPacket, sizeof(recvPacket), 0, (struct sockaddr*)&client_addr, sockaddr_len);
+                if (err < 0)
+                {
+                    ESP_LOGE(TAG, "%s: Error sending sending response to client at address %s. errno = %s\n", __func__, client_addr_str, strerror(errno));
+                    error = true;
+                }
+            }
+        }
+
+        if (error) 
+        {
+            break;
+        }
+
+        // At this point the playback task is blocked waiting for new data. 
+        // It is safe to swap the active and background buffers
+        AudioPacket_t* tmp = activePacket;
+        activePacket = backgroundPacket;
+        backgroundPacket = tmp;
+
+        // Signal to the playback task that new data is available
+        xTaskNotifyGiveIndexed(playbackTaskHandle, dataReadyNotifyIndex);
+    }
+
+    // We should only be here if the client got disconnected
     gState = WAIT_FOR_CLIENT;
 
     return ESP_OK;
 }
 
-static void udp_server_task(void *pvParameters)
+
+////////////////////////////////////////////////////////////////////
+// receive_task()
+//
+////////////////////////////////////////////////////////////////////
+static void receive_task(void *pvParameters)
 {
-    int addr_family = (int)pvParameters;
+    int addr_family = AF_INET;
     struct sockaddr_in dest_addr;       // server IP address
 
     int sock;                           // socket file descriptor
@@ -543,7 +678,7 @@ static void udp_server_task(void *pvParameters)
             }
             case SETUP_SERVER:
             {
-                ESP_ERROR_CHECK( setupServer(addr_family, &dest_addr, &sock) );
+                ESP_ERROR_CHECK( setup_server(addr_family, &dest_addr, &sock) );
                 break;
             }
             case WAIT_FOR_CLIENT:
@@ -565,7 +700,8 @@ static void udp_server_task(void *pvParameters)
             case STREAM_FROM_CLIENT:
             {
                 // This only returns if a client disconnects
-                ESP_ERROR_CHECK( streamFromClient(sock) );
+                ESP_ERROR_CHECK(stream_from_client(sock));
+                gState = WAIT_FOR_CLIENT;
                 break;
             }
             default:
@@ -578,6 +714,53 @@ static void udp_server_task(void *pvParameters)
     vTaskDelete(NULL);
 }
 
+
+////////////////////////////////////////////////////////////////////
+// playback_task()
+//
+////////////////////////////////////////////////////////////////////
+void playback_task(void* pvParameters)
+{
+
+    const uint32_t SAMPLE_RATE = 44100; //hz    
+    const uint32_t SAMPLE_PERIOD_MS = 10;
+
+    while (receiveTaskHandle == NULL)
+    {
+        ESP_LOGI(TAG, "%s Waiting for receive task to come up\n", __func__);
+        vTaskDelay(500);
+    }
+
+    // Let the receive task collect some data
+    vTaskDelay(20);
+
+    bool error = false;
+    while (!error)
+    {
+        // Notify the receive task that we are waiting for new data
+        ESP_LOGI(TAG, "%s Notifying receive task of playback done\n", __func__);
+        xTaskNotifyGiveIndexed(receiveTaskHandle, playbackDoneNotifyIndex);
+
+        // Wait for new data
+        ESP_LOGI(TAG, "%s Waiting for new data\n", __func__);
+        if (ulTaskNotifyTakeIndexed(dataReadyNotifyIndex, pdTRUE, pdMS_TO_TICKS(1000)))
+        {
+            ESP_LOGI(TAG, "%s Got data ready notification\n", __func__);
+        }
+        else
+        {
+            // Task will effectively block until we get the data ready notification
+            ESP_LOGE(TAG, "%s Timed out waiting for data ready notification\n", __func__);
+            continue;
+        }
+
+        // Process active buffer (ESP32 has an asynchronous DMA for streaming audio data to a DAC)
+        ESP_LOGI(TAG, "%s Processing active buffer (%u bytes)\n", __func__, activePacket->payloadSize);
+        vTaskDelay(pdMS_TO_TICKS(SAMPLE_PERIOD_MS) * activePacket->payloadSize);
+    }
+}
+
+
 void app_main(void)
 {
     ESP_ERROR_CHECK(esp_netif_init());
@@ -588,6 +771,42 @@ void app_main(void)
     ESP_LOGI(TAG, "%s LWIP config'd\n", __func__);
     #endif
 
-    xTaskCreate(udp_server_task, "udp_server", 4096, (void*)AF_INET, 5, NULL);
+    activePacket = &gAudioPackets[0];
+    backgroundPacket = &gAudioPackets[1];
+
+    memset(activePacket, 0, sizeof(struct AudioPacket_t));
+    memset(backgroundPacket, 0, sizeof(struct AudioPacket_t));
+
+    // Create "receive" and "playback" tasks
+    //
+    // The receive task is responsible for receiving audio
+    // packets from a client. The receive task will populate
+    // an back buffer that is invisible to the playback
+    // task. The receive task will populate the back buffer
+    // until the playback task signals that it needs new data.
+    //
+    // The playback task is responsible for converting the
+    // audio data in a front buffer to analog and driving
+    // the amplifier circuit. When it is out of data, the 
+    // playback task will notify the receive task and block
+    // and until there is new data available.
+    ESP_LOGI(TAG, "%s Creating tasks\n", __func__);
+    BaseType_t status;
+
+    status = xTaskCreatePinnedToCore(receive_task, "receive_task", 8192, NULL, 5, &receiveTaskHandle, ESP_CORE_0);
+
+    if (status != pdPASS)
+    {
+        ESP_LOGE(TAG, "%s Failed to create receive task!\n", __func__);
+        return;
+    }
+    
+    status = xTaskCreatePinnedToCore(playback_task, "playback_task", 8192, NULL, 5, &playbackTaskHandle, ESP_CORE_1);
+
+    if (status != pdPASS)
+    {
+        ESP_LOGE(TAG, "%s Failed to create transmit task!\n", __func__);
+        return;
+    }
 
 }
