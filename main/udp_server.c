@@ -41,8 +41,6 @@
 #define WIFI_STATION_CONNECT_MAXIMUM_RETRIES  10
 #define WIFI_EVENT_AP_STACONNECTED_BIT        BIT0     // a wifi station connected to this device
 #define WIFI_EVENT_AP_STADISCONNECTED_BIT     BIT1     // a wifi station disconnected from this device
-#define IP_EVENT_STA_GOT_IP_BIT               BIT2     // this device connected to a wifi access point
-#define WIFI_EVENT_STA_FAILED_BIT             BIT3     // this device failed to connect to a wifi access point
 
 #define ESP_CORE_0      0       // physical core 0
 #define ESP_CORE_1      1       // physical core 1
@@ -51,7 +49,6 @@
 typedef enum State_t
 {
     SETUP_WIFI_DRIVER,
-    SET_SYSTEM_TIME,
     SETUP_SERVER,
     WAIT_FOR_CLIENT,
     STREAM_FROM_CLIENT,
@@ -84,7 +81,6 @@ static const char *TAG = "wifi_ap";
 
 /* FreeRTOS event group to signal when a client is connected or disconnected */
 static EventGroupHandle_t s_wifi_event_group;
-static uint32_t s_wifi_station_retry_num = 0;      // number of retries attempting to connect to access point (home network)
 
 static AudioPacket_t gAudioPackets[2];
 static AudioPacket_t * activePacket;               // transmitting task transmits this packet
@@ -110,7 +106,7 @@ esp_err_t wifi_setup_driver(wifi_init_config_t* cfg)
 
     ESP_ERROR_CHECK(esp_wifi_init(cfg));
 
-    gState = SET_SYSTEM_TIME;
+    gState = SETUP_SERVER;
 
     return ESP_OK;
 }
@@ -159,187 +155,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
             ESP_ERROR_CHECK(esp_wifi_connect());
             break;
         }
-        case IP_EVENT_STA_GOT_IP:
-        {
-            ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
-            ESP_LOGI(TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
-            s_wifi_station_retry_num = 0;
-            xEventGroupSetBits(s_wifi_event_group, IP_EVENT_STA_GOT_IP_BIT);
-            break;
-        }
-        case WIFI_EVENT_STA_DISCONNECTED:
-        {
-            wifi_event_sta_disconnected_t* event = (wifi_event_sta_disconnected_t*) event_data;
-            ESP_LOGE(TAG, "%s Disconnected from network %s. Reason: %u\n", __func__, (const char*)event->ssid, event->reason);
-            if (s_wifi_station_retry_num < WIFI_STATION_CONNECT_MAXIMUM_RETRIES) {
-                esp_err_t ret = esp_wifi_connect();
-                ESP_LOGI(TAG, "%s ret = %s\n", __func__, esp_err_to_name(ret));
-                s_wifi_station_retry_num++;
-                ESP_LOGI(TAG, "retry to connect to the AP");
-            } else {
-                xEventGroupSetBits(s_wifi_event_group, WIFI_EVENT_STA_FAILED_BIT);
-            }
-            ESP_LOGI(TAG,"connect to the AP fail");      
-            break;
-        }
-
     }
-}
-
-
-////////////////////////////////////////////////////////////////////
-// wifi_station_start_and_connect()
-//
-////////////////////////////////////////////////////////////////////
-esp_err_t wifi_station_start_and_connect(wifi_config_t* wifi_config, bool* error)
-{
-    *error = true;
-    esp_event_handler_instance_t instance_any_id;
-    esp_event_handler_instance_t instance_got_ip;
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
-                                                        ESP_EVENT_ANY_ID,
-                                                        &wifi_event_handler,
-                                                        NULL,
-                                                        &instance_any_id));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
-                                                        IP_EVENT_STA_GOT_IP,
-                                                        &wifi_event_handler,
-                                                        NULL,
-                                                        &instance_got_ip));
-
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA) );
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, wifi_config) );
-    ESP_ERROR_CHECK(esp_wifi_start() );
-
-    ESP_LOGI(TAG, "wifi_station_start finished.");
-
-    /* Waiting until either the connection is established (WIFI_CONNECTED_BIT) or connection failed for the maximum
-     * number of re-tries (WIFI_FAIL_BIT). The bits are set by event_handler() (see above) */
-    xEventGroupClearBits(s_wifi_event_group, IP_EVENT_STA_GOT_IP_BIT | WIFI_EVENT_STA_FAILED_BIT);
-    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
-            IP_EVENT_STA_GOT_IP_BIT | WIFI_EVENT_STA_FAILED_BIT,
-            pdFALSE,
-            pdFALSE,
-            portMAX_DELAY);
-    
-    /* xEventGroupWaitBits() returns the bits before the call returned, hence we can test which event actually
-     * happened. */
-    const char* ssid = (const char*)(wifi_config->sta.ssid);
-    const char* password = (const char*)(wifi_config->sta.password);
-    if (bits & IP_EVENT_STA_GOT_IP_BIT)
-    {
-        ESP_LOGI(TAG, "%s: connected to ap SSID:%s password:%s",
-                __func__, ssid, password);
-        *error = false;
-    } 
-    else if (bits & WIFI_EVENT_STA_FAILED_BIT) 
-    {
-        ESP_LOGI(TAG, "%s: Failed to connect to SSID:%s, password:%s",
-                __func__, ssid, password);
-    } 
-    else 
-    {
-        ESP_LOGE(TAG, "%s: UNEXPECTED EVENT: %lx\n",
-                __func__, bits);
-    }
-
-    return ESP_OK;
-}
-
-
-////////////////////////////////////////////////////////////////////
-// wifi_station_disconnect_and_stop()
-//
-////////////////////////////////////////////////////////////////////
-esp_err_t wifi_station_disconnect_and_stop()
-{
-    // Stop subscribing to station-related callbacks
-    ESP_ERROR_CHECK(esp_event_handler_unregister(WIFI_EVENT,
-                                                        ESP_EVENT_ANY_ID,
-                                                        &wifi_event_handler));
-    ESP_ERROR_CHECK(esp_event_handler_unregister(IP_EVENT,
-                                                        IP_EVENT_STA_GOT_IP,
-                                                        &wifi_event_handler));
-
-    esp_err_t ret = esp_wifi_disconnect();
-    if (ret == ESP_ERR_WIFI_NOT_INIT)
-    {
-        ESP_LOGE(TAG, "%s ESP32 Wifi was not initialized by wifi_station_start_and_connect()\n", __func__);
-    }
-    else if (ret != ESP_OK)
-    {
-        ESP_LOGE(TAG, "%s Unexpected errno: %s\n", __func__, esp_err_to_name(ret));
-    }
-
-    ret = esp_wifi_stop();
-
-    if (ret == ESP_ERR_WIFI_NOT_INIT)
-    {
-        ESP_LOGE(TAG, "%s ESP32 Wifi was not initialized by wifi_station_start_and_connect()\n", __func__);
-    }
-    else if (ret != ESP_OK)
-    {
-        ESP_LOGE(TAG, "%s Unexpected errno: %s\n", __func__, esp_err_to_name(ret));
-    }
-
-    return ret;
-}
-
-
-////////////////////////////////////////////////////////////////////
-// set_system_time()
-//
-////////////////////////////////////////////////////////////////////
-esp_err_t set_system_time(wifi_config_t* wifi_config, bool* error)
-{
-    // connect to sntp server
-    ESP_LOGI(TAG, "%s Initializing sntp network interface\n", __func__);
-
-    // TODO: Verify that we are connected to a Wifi network before connecting
-    //       to the NTP server
-    esp_sntp_config_t config = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
-    config.start = false;   // wait for Wifi connection before starting SNTP service
-    config.server_from_dhcp = true;     // use DHCP server to get SNTP IP address
-    config.smooth_sync = true;          // gradually reduce time error
-    ESP_ERROR_CHECK(esp_netif_sntp_init(&config));
-
-    ESP_LOGI(TAG, "%s Starting SNTP client\n", __func__);
-    ESP_ERROR_CHECK(esp_netif_sntp_start());
-
-    time_t now = 0;
-    struct tm timeinfo = { 0 };
-    esp_err_t ret = esp_netif_sntp_sync_wait(pdMS_TO_TICKS(10000));
-    if (ret != ESP_OK)
-    {
-        ESP_LOGE(TAG, "%s: Failed to update system time within 10s timeout! error: %s\n", __func__, esp_err_to_name(ret));
-        *error = true;
-        return ESP_OK;
-    }
-
-    int i = 0;
-    while (sntp_get_sync_status() == SNTP_SYNC_STATUS_IN_PROGRESS)
-    {
-       i++;
-    }
-
-    ESP_LOGI(TAG, "%s: took %d iterations to finish syncing\n" , __func__, i);
-
-    time(&now);
-    localtime_r(&now, &timeinfo);
-    ESP_LOGI(TAG, "%s: Connected to SNTP server!\n", __func__);
-
-    esp_netif_sntp_deinit();
-
-    char strftime_buf[64];
-
-    // Set timezone to Eastern Standard Time and print local time
-    setenv("TZ", "EST5EDT,M3.2.0/2,M11.1.0", 1);
-    tzset();
-    localtime_r(&now, &timeinfo);
-    strftime(strftime_buf, sizeof(strftime_buf), "%c", &timeinfo);
-    ESP_LOGI(TAG, "The current date/time in New York is: %s", strftime_buf);
-
-    return ESP_OK;
 }
 
 
@@ -406,6 +222,10 @@ esp_err_t _wifi_softap_start()
     return ESP_OK;
 }
 
+////////////////////////////////////////////////////////////////////
+// crc16()
+//
+////////////////////////////////////////////////////////////////////
 uint16_t crc16(uint8_t* data, uint32_t len)
 {
     // Compute a crc16 using polynomial 0x1021 and seed value 0xFFFF
@@ -520,6 +340,8 @@ esp_err_t stream_from_client(const int sock)
     while (!error)
     {
 
+        backgroundPacket->payloadSize = 0;
+
         // Keep receiving data into the background buffer until the playback task
         // signals that it is ready for new data
         while(!ulTaskNotifyTakeIndexed(playbackDoneNotifyIndex, pdTRUE, 0))
@@ -571,7 +393,7 @@ esp_err_t stream_from_client(const int sock)
                 backgroundPacket->payloadSize = 0;
             }
             memcpy(&backgroundPacket->payload[backgroundPacket->payloadSize], recvPacket.payload, recvPacket.payloadSize);
-
+            backgroundPacket->payloadSize += recvPacket.payloadSize;
             // echo the packet
             if (recvPacket.echo)
             {
@@ -619,10 +441,7 @@ static void receive_task(void *pvParameters)
     int sock;                           // socket file descriptor
 
     s_wifi_event_group = xEventGroupCreate();
-    xEventGroupClearBits(s_wifi_event_group, WIFI_EVENT_AP_STACONNECTED_BIT
-                                             | WIFI_EVENT_AP_STADISCONNECTED_BIT
-                                             | IP_EVENT_STA_GOT_IP_BIT          
-                                             | WIFI_EVENT_STA_FAILED_BIT);
+    xEventGroupClearBits(s_wifi_event_group, WIFI_EVENT_AP_STACONNECTED_BIT | WIFI_EVENT_AP_STADISCONNECTED_BIT);
 
     gState = SETUP_WIFI_DRIVER;     // initialize global state object
 
@@ -637,45 +456,6 @@ static void receive_task(void *pvParameters)
                 wifi_setup_driver(&cfg);
                 break;
             } 
-            case SET_SYSTEM_TIME:
-            {
-                static uint32_t num_attempts = 0;
-                wifi_config_t home_wifi_config = {
-                    .sta = {
-                        .ssid = "NETGEAR56",
-                        .password = "livelyoctopus070",
-                    },
-                }; 
-
-                bool error;
-                num_attempts++;
-
-                // connect to home wifi network
-                ESP_LOGI(TAG, "%s Connecting to home WiFi", __func__);
-                ESP_ERROR_CHECK(wifi_station_start_and_connect(&home_wifi_config, &error));
-
-                if (error)
-                {
-                    ESP_LOGE(TAG, "%s Failed to connect to home WiFi on attempt %lu\n", __func__, num_attempts);
-                    break;
-                }
-
-                ESP_LOGI(TAG, "%s Setting system time", __func__);
-                ESP_ERROR_CHECK(set_system_time(&home_wifi_config, &error));
-
-                if (error)
-                {
-                    ESP_LOGE(TAG, "%s Failed to set system time on attempt %lu\n", __func__, num_attempts);
-                    break;
-                }
-
-                // disconnect from home wifi network
-                ESP_LOGI(TAG, "%s Disconnecting from home WiFi", __func__);
-                ESP_ERROR_CHECK(wifi_station_disconnect_and_stop());
-
-                gState = SETUP_SERVER;
-                break;
-            }
             case SETUP_SERVER:
             {
                 ESP_ERROR_CHECK( setup_server(addr_family, &dest_addr, &sock) );
