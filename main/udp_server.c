@@ -46,6 +46,13 @@
 #define ESP_CORE_1      1       // physical core 1
 #define PAYLOAD_MAX_LEN 996
 
+#define DEBUG 0
+#if DEBUG
+    #define PRINTF_DEBUG( msg ) ESP_LOGI msg
+#else
+    #define PRINTF_DEBUG( msg )
+#endif
+
 typedef enum State_t
 {
     SETUP_WIFI_DRIVER,
@@ -60,8 +67,9 @@ typedef struct AudioPacket_t
 {
     uint16_t seqnum;
     bool     echo;                  // client requested an echo from server
-    uint16_t checksum;              // crc-16
     uint16_t payloadSize;
+    uint16_t payloadStart;
+    uint16_t checksum;              // crc-16
     uint8_t  payload[PAYLOAD_MAX_LEN];
 } AudioPacket_t;
 
@@ -330,6 +338,9 @@ esp_err_t stream_from_client(const int sock)
     char client_addr_str[128];
     memset(client_addr_str, 0, sizeof(client_addr_str));
 
+    uint32_t numPacketTimeouts = 0;
+    const uint32_t MAX_PACKET_TIMEOUTS = 3;
+
     while (playbackTaskHandle == NULL)
     {
         ESP_LOGI(TAG, "%s Waiting for playback task to come up\n", __func__);
@@ -351,10 +362,19 @@ esp_err_t stream_from_client(const int sock)
 
             if (len < 0)
             {
-                ESP_LOGE(TAG, "recvfrom failed: errno %d (%s)", errno, strerror(errno));
-                error = true;
-                break;
+                if (errno == EWOULDBLOCK && ++numPacketTimeouts < MAX_PACKET_TIMEOUTS)
+                {
+                    ESP_LOGE(TAG, "%s recvfrom timed out but continuing\n", __func__);
+                }
+                else
+                {
+                    ESP_LOGE(TAG, "%s recvfrom failed: errno %d (%s)", __func__, errno, strerror(errno));
+                    error = true;
+                    break;
+                }
             }    
+
+            numPacketTimeouts = 0;
         
             // Cache the client IP address in case we want to echo back a packet
             // TODO: Can we get the IP address in wait_for_client()?
@@ -381,8 +401,8 @@ esp_err_t stream_from_client(const int sock)
                 continue;
             }
 
-            ESP_LOGI(TAG, "%s: Successfully received packet with checksum 0x%x, seqnum %u, payload size %u\n", 
-                __func__, checksum, recvPacket.seqnum, recvPacket.payloadSize);
+            PRINTF_DEBUG((TAG, "%s: Successfully received packet with checksum 0x%x, seqnum %u, payload size %u\n", 
+                __func__, checksum, recvPacket.seqnum, recvPacket.payloadSize));
 
             // Copy into background buffer
             if (recvPacket.payloadSize + backgroundPacket->payloadSize >= PAYLOAD_MAX_LEN)
@@ -392,12 +412,36 @@ esp_err_t stream_from_client(const int sock)
                 ESP_LOGI(TAG, "%s background buffer would overflow. Clearing buffer.\n", __func__);
                 backgroundPacket->payloadSize = 0;
             }
-            memcpy(&backgroundPacket->payload[backgroundPacket->payloadSize], recvPacket.payload, recvPacket.payloadSize);
-            backgroundPacket->payloadSize += recvPacket.payloadSize;
+            
+            // The recvpacket payload may have overflowed. If this happens, the first audio sample 
+            // will start at a non-zero offset into recvPacket->payload, and the audio stream will 
+            // wrap around to the beginning of recvPacket->payload.
+            //
+            //         Normal Case:                              Wraparound case:
+            //
+            //            -----------------------------------     -----------------------------------
+            //            |          Payload Array          |     |          Payload Array          |
+            //            -----------------------------------     -----------------------------------
+            //            |<---------------->|                    |<------------->| |<-------------->|
+            //               ^ first and only chunk                        ^                 ^ 
+            //               of audio data                          second chunk      first chunk of
+            //                                                      of packet         audio data
+            //
+            uint32_t numBytesFirstChunk = MIN(PAYLOAD_MAX_LEN - recvPacket.payloadStart, recvPacket.payloadSize);
+            uint32_t numBytesSecondChunk = recvPacket.payloadSize - numBytesFirstChunk;
+
+            memcpy(&backgroundPacket->payload[backgroundPacket->payloadSize], &recvPacket.payload[recvPacket.payloadStart], numBytesFirstChunk);
+            backgroundPacket->payloadSize += numBytesFirstChunk;
+
+            memcpy(&backgroundPacket->payload[backgroundPacket->payloadSize], &recvPacket.payload[0], numBytesSecondChunk);
+            backgroundPacket->payloadSize += numBytesSecondChunk;
+
             // echo the packet
             if (recvPacket.echo)
             {
 
+                ESP_LOGI(TAG, "%s: Echoing back packet with checksum 0x%x, seqnum %u, payload size %u.\n", 
+                    __func__, checksum, recvPacket.seqnum, recvPacket.payloadSize);
                 int err = sendto(sock, (void*)&recvPacket, sizeof(recvPacket), 0, (struct sockaddr*)&client_addr, sockaddr_len);
                 if (err < 0)
                 {
@@ -503,7 +547,7 @@ void playback_task(void* pvParameters)
 {
 
     const uint32_t SAMPLE_RATE = 44100; //hz    
-    const uint32_t SAMPLE_PERIOD_MS = 10;
+    const uint32_t MS_PER_SAMPLE = (uint32_t)(1.0f / SAMPLE_RATE * 1000);
 
     while (receiveTaskHandle == NULL)
     {
@@ -518,25 +562,21 @@ void playback_task(void* pvParameters)
     while (!error)
     {
         // Notify the receive task that we are waiting for new data
-        ESP_LOGI(TAG, "%s Notifying receive task of playback done\n", __func__);
+        PRINTF_DEBUG((TAG, "%s Notifying receive task of playback done\n", __func__));
         xTaskNotifyGiveIndexed(receiveTaskHandle, playbackDoneNotifyIndex);
 
         // Wait for new data
-        ESP_LOGI(TAG, "%s Waiting for new data\n", __func__);
-        if (ulTaskNotifyTakeIndexed(dataReadyNotifyIndex, pdTRUE, pdMS_TO_TICKS(1000)))
+        PRINTF_DEBUG((TAG, "%s Waiting for new data\n", __func__));
+        while (!ulTaskNotifyTakeIndexed(dataReadyNotifyIndex, pdTRUE, pdMS_TO_TICKS(1000)))
         {
-            ESP_LOGI(TAG, "%s Got data ready notification\n", __func__);
-        }
-        else
-        {
-            // Task will effectively block until we get the data ready notification
-            ESP_LOGE(TAG, "%s Timed out waiting for data ready notification\n", __func__);
-            continue;
+            vTaskDelay(1);
         }
 
+        PRINTF_DEBUG((TAG, "%s Got data ready notification\n", __func__));
+
         // Process active buffer (ESP32 has an asynchronous DMA for streaming audio data to a DAC)
-        ESP_LOGI(TAG, "%s Processing active buffer (%u bytes)\n", __func__, activePacket->payloadSize);
-        vTaskDelay(pdMS_TO_TICKS(SAMPLE_PERIOD_MS) * activePacket->payloadSize);
+        PRINTF_DEBUG((TAG, "%s Processing active buffer (%u bytes)\n", __func__, activePacket->payloadSize));
+        vTaskDelay(MIN(pdMS_TO_TICKS(1), pdMS_TO_TICKS(MS_PER_SAMPLE * activePacket->payloadSize)));
     }
 }
 
