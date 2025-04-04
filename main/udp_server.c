@@ -44,7 +44,7 @@
 
 #define ESP_CORE_0      0       // physical core 0
 #define ESP_CORE_1      1       // physical core 1
-#define PAYLOAD_MAX_LEN 996
+#define PAYLOAD_MAX_LEN 996     // maximum amount of audio data we can receive from client at a time
 
 #define DEBUG 0
 #if DEBUG
@@ -90,9 +90,20 @@ static const char *TAG = "wifi_ap";
 /* FreeRTOS event group to signal when a client is connected or disconnected */
 static EventGroupHandle_t s_wifi_event_group;
 
-static AudioPacket_t gAudioPackets[2];
-static AudioPacket_t * activePacket;               // transmitting task transmits this packet
-static AudioPacket_t * backgroundPacket;           // sampling task fills this packet
+#define PLAYBACK_TASK_REQ_DATA_SIZE         PAYLOAD_MAX_LEN
+#define PLAYBACK_TASK_DESIRED_DATA_SIZE     (uint16_t)(PAYLOAD_MAX_LEN * 1.5)
+#define SHARED_BUFFER_LEN                   (4 * PAYLOAD_MAX_LEN)
+
+typedef struct SharedBuffer_t
+{
+    uint16_t payloadStart;
+    uint16_t payloadSize;
+    uint8_t  payload[SHARED_BUFFER_LEN];
+} SharedBuffer_t;
+
+static SharedBuffer_t gSharedBuffer[2];
+static SharedBuffer_t* activeBuffer;               // transmitting task transmits this packet
+static SharedBuffer_t* backBuffer;           // sampling task fills this packet
 
 static const UBaseType_t playbackDoneNotifyIndex = 0;      // set by the playback task when it is done processing audio data
 static const UBaseType_t dataReadyNotifyIndex;             // set by the receive task when there is new data available for the playback task
@@ -325,6 +336,101 @@ esp_err_t setup_server(int addr_family, struct sockaddr_in* dest_addr, int* sock
 
 
 ////////////////////////////////////////////////////////////////////
+// copy_to_back_buffer()
+//
+// Helper function for unwrapping received audio data and 
+// copying to the background buffer.
+////////////////////////////////////////////////////////////////////
+void copy_recv_data_to_back_buffer(const AudioPacket_t* recvPacket, SharedBuffer_t* backBuffer)
+{
+
+    assert(backBuffer->payloadStart == 0);
+    assert(recvPacket->payloadSize < SHARED_BUFFER_LEN);
+
+    // Clear out the background buffer if the recvPacket will cause it to overflow
+    // This shouldn't technically be possible since the playback task should drain 
+    // this buffer long before it overflows
+    if (recvPacket->payloadSize + backBuffer->payloadSize >= SHARED_BUFFER_LEN)
+    {
+        ESP_LOGI(TAG, "%s background buffer would overflow. Clearing buffer.\n", __func__);
+        backBuffer->payloadSize = 0;
+        backBuffer->payloadStart = 0;
+    }
+
+    // The recvpacket payload may have overflowed on the client-side. If this happens, the 
+    // first audio sample will start at a non-zero offset into recvPacket->payload, and the audio stream will 
+    // wrap around to the beginning of recvPacket->payload.
+    //
+    //         Normal Case:                              Wraparound case:
+    //
+    //            -----------------------------------     -----------------------------------
+    //            |          Payload Array          |     |          Payload Array          |
+    //            -----------------------------------     -----------------------------------
+    //            |<---------------->|                    |<------------->| |<-------------->|
+    //               ^ first and only chunk                        ^                 ^ 
+    //               of audio data                          second chunk      first chunk of
+    //                                                      of packet         audio data
+    //
+    uint32_t numBytesFirstChunk = MIN(PAYLOAD_MAX_LEN - recvPacket->payloadStart, recvPacket->payloadSize);
+    uint32_t numBytesSecondChunk = recvPacket->payloadSize - numBytesFirstChunk;
+
+    if (recvPacket->payloadStart != 0)
+    {
+        ESP_LOGI(TAG, "%s recvPacket size = %u, start = %u, back buffer size = %u, first chunk = %lu, second chunk = %lu\n",
+            __func__, recvPacket->payloadSize, recvPacket->payloadStart, backBuffer->payloadSize, 
+            numBytesFirstChunk, numBytesSecondChunk);
+    }
+    memcpy(&backBuffer->payload[backBuffer->payloadStart], &recvPacket->payload[recvPacket->payloadStart], numBytesFirstChunk);
+    backBuffer->payloadSize += numBytesFirstChunk;
+
+    memcpy(&backBuffer->payload[backBuffer->payloadStart], &recvPacket->payload[0], numBytesSecondChunk);
+    backBuffer->payloadSize += numBytesSecondChunk;
+
+    assert(backBuffer->payloadSize < SHARED_BUFFER_LEN);
+}
+
+
+////////////////////////////////////////////////////////////////////
+// copy_back_buffer_to_active_buffer()
+//
+// Drains the back buffer into the active buffer.
+////////////////////////////////////////////////////////////////////
+void copy_back_buffer_to_active_buffer()
+{
+    assert(backBuffer->payloadStart == 0);
+
+    if (activeBuffer->payloadSize + backBuffer->payloadSize > SHARED_BUFFER_LEN)
+    {
+        ESP_LOGE(__func__, "back buffer too large to copy into active buffer, resetting active buffer");
+        ESP_LOGE(__func__, "active buffer size = %u, back buffer size = %u, limit = %u\n",
+            activeBuffer->payloadSize, backBuffer->payloadSize, SHARED_BUFFER_LEN);
+
+        memcpy(&activeBuffer->payload[0], &backBuffer->payload[backBuffer->payloadStart], backBuffer->payloadSize);
+        activeBuffer->payloadSize = backBuffer->payloadSize;
+        activeBuffer->payloadStart = 0;
+        backBuffer->payloadSize = 0;
+        backBuffer->payloadStart = 0;
+        return;
+    }
+
+    // Move any leftover data in the active buffer to the beginning of the active buffer
+    PRINTF_DEBUG((__func__, "BEFORE: active payload start = %u, size = %u, back buffer size = %u\n", 
+        activeBuffer->payloadStart, activeBuffer->payloadSize, backBuffer->payloadSize));
+    memmove(&activeBuffer->payload[0], &activeBuffer->payload[activeBuffer->payloadStart], activeBuffer->payloadSize);
+    activeBuffer->payloadStart = 0;
+
+    // Copy background buffer data into the active buffer
+    memcpy(&activeBuffer->payload[activeBuffer->payloadSize], &backBuffer->payload[backBuffer->payloadStart], backBuffer->payloadSize);
+    activeBuffer->payloadSize += backBuffer->payloadSize;
+
+    backBuffer->payloadSize = 0;
+    backBuffer->payloadStart = 0;
+
+    PRINTF_DEBUG((__func__, "AFTER: active payload start = %u, size = %u, back buffer size = %u\n", 
+        activeBuffer->payloadStart, activeBuffer->payloadSize, backBuffer->payloadSize));
+}
+
+////////////////////////////////////////////////////////////////////
 // stream_from_client()
 //
 ////////////////////////////////////////////////////////////////////
@@ -333,7 +439,10 @@ esp_err_t stream_from_client(const int sock)
     struct sockaddr_storage client_addr;
     socklen_t sockaddr_len = sizeof(client_addr);
     struct AudioPacket_t recvPacket;
-    bool isFirstPacket = true;
+
+    bool isFirstPacket = true;      // are we waiting on the first packet from the client?
+    bool isFirstBufSwap = true;     // are we about to swap buffers with the playback task for the first time?
+    uint16_t expectedSeqnum = 0;
 
     char client_addr_str[128];
     memset(client_addr_str, 0, sizeof(client_addr_str));
@@ -351,13 +460,15 @@ esp_err_t stream_from_client(const int sock)
     while (!error)
     {
 
-        backgroundPacket->payloadSize = 0;
+        uint32_t minPayloadSizeBeforeSwap = isFirstBufSwap ? PLAYBACK_TASK_DESIRED_DATA_SIZE : PLAYBACK_TASK_REQ_DATA_SIZE;
 
-        // Keep receiving data into the background buffer until the playback task
-        // signals that it is ready for new data
-        while(!ulTaskNotifyTakeIndexed(playbackDoneNotifyIndex, pdTRUE, 0))
+        // Keep receiving data into the background buffer until 
+        //   a) (at startup only) the receive task has accumulated sufficient data
+        //   b) the playback task signals that it is ready for new data
+        while((backBuffer->payloadSize < minPayloadSizeBeforeSwap) || !ulTaskNotifyTakeIndexed(playbackDoneNotifyIndex, pdTRUE, 0))
         {
             // receive packet
+            memset(&recvPacket, 0, sizeof(recvPacket));
             int len = recvfrom(sock, &recvPacket, sizeof(recvPacket), 0, (struct sockaddr*)&client_addr, &sockaddr_len);
 
             if (len < 0)
@@ -365,6 +476,8 @@ esp_err_t stream_from_client(const int sock)
                 if (errno == EWOULDBLOCK && ++numPacketTimeouts < MAX_PACKET_TIMEOUTS)
                 {
                     ESP_LOGE(TAG, "%s recvfrom timed out but continuing\n", __func__);
+                    expectedSeqnum = 0;
+                    continue;
                 }
                 else
                 {
@@ -398,51 +511,49 @@ esp_err_t stream_from_client(const int sock)
             if (checksum != recvPacket.checksum)
             {
                 ESP_LOGE(TAG, "%s: Invalid checksum. Got 0x%x, expected 0x%x\n", __func__, checksum, recvPacket.checksum);
+                ESP_LOGE(TAG, "%s: checksum 0x%x, seqnum %u, payload size %u\n", 
+                    __func__, checksum, recvPacket.seqnum, recvPacket.payloadSize);
                 continue;
+            }
+
+            // Check if a packet was duplicated or dropped 
+            if (expectedSeqnum > recvPacket.seqnum)
+            {
+                // Client sent a packet that the server has already seen
+                ESP_LOGI(__func__, "SERVER AHEAD: expected seqnum %u, received packet seqnum %u\n",
+                    expectedSeqnum, recvPacket.seqnum);
+            }
+            else if (expectedSeqnum < recvPacket.seqnum)
+            {
+                // A packet got dropped in transit
+                ESP_LOGI(__func__, "SERVER BEHIND: expected seqnum %u, received packet seqnum %u\n",
+                    expectedSeqnum, recvPacket.seqnum);
+                expectedSeqnum = recvPacket.seqnum + 1;
+            }
+            else
+            {
+                expectedSeqnum++;
             }
 
             PRINTF_DEBUG((TAG, "%s: Successfully received packet with checksum 0x%x, seqnum %u, payload size %u\n", 
                 __func__, checksum, recvPacket.seqnum, recvPacket.payloadSize));
 
             // Copy into background buffer
-            if (recvPacket.payloadSize + backgroundPacket->payloadSize >= PAYLOAD_MAX_LEN)
-            {
-                // This shouldn't technically be possible since the client and server are
-                // processing audio data at the same rate
-                ESP_LOGI(TAG, "%s background buffer would overflow. Clearing buffer.\n", __func__);
-                backgroundPacket->payloadSize = 0;
-            }
-            
-            // The recvpacket payload may have overflowed. If this happens, the first audio sample 
-            // will start at a non-zero offset into recvPacket->payload, and the audio stream will 
-            // wrap around to the beginning of recvPacket->payload.
-            //
-            //         Normal Case:                              Wraparound case:
-            //
-            //            -----------------------------------     -----------------------------------
-            //            |          Payload Array          |     |          Payload Array          |
-            //            -----------------------------------     -----------------------------------
-            //            |<---------------->|                    |<------------->| |<-------------->|
-            //               ^ first and only chunk                        ^                 ^ 
-            //               of audio data                          second chunk      first chunk of
-            //                                                      of packet         audio data
-            //
-            uint32_t numBytesFirstChunk = MIN(PAYLOAD_MAX_LEN - recvPacket.payloadStart, recvPacket.payloadSize);
-            uint32_t numBytesSecondChunk = recvPacket.payloadSize - numBytesFirstChunk;
+            copy_recv_data_to_back_buffer(&recvPacket, backBuffer);
 
-            memcpy(&backgroundPacket->payload[backgroundPacket->payloadSize], &recvPacket.payload[recvPacket.payloadStart], numBytesFirstChunk);
-            backgroundPacket->payloadSize += numBytesFirstChunk;
-
-            memcpy(&backgroundPacket->payload[backgroundPacket->payloadSize], &recvPacket.payload[0], numBytesSecondChunk);
-            backgroundPacket->payloadSize += numBytesSecondChunk;
+            PRINTF_DEBUG((TAG, "%s back buffer size = %u\n", __func__, backBuffer->payloadSize));
 
             // echo the packet
+            // TODO: Defer this to immediately after we have 
+            //       provided new data to the playback task
             if (recvPacket.echo)
             {
 
                 ESP_LOGI(TAG, "%s: Echoing back packet with checksum 0x%x, seqnum %u, payload size %u.\n", 
                     __func__, checksum, recvPacket.seqnum, recvPacket.payloadSize);
+
                 int err = sendto(sock, (void*)&recvPacket, sizeof(recvPacket), 0, (struct sockaddr*)&client_addr, sockaddr_len);
+
                 if (err < 0)
                 {
                     ESP_LOGE(TAG, "%s: Error sending sending response to client at address %s. errno = %s\n", __func__, client_addr_str, strerror(errno));
@@ -457,17 +568,19 @@ esp_err_t stream_from_client(const int sock)
         }
 
         // At this point the playback task is blocked waiting for new data. 
-        // It is safe to swap the active and background buffers
-        AudioPacket_t* tmp = activePacket;
-        activePacket = backgroundPacket;
-        backgroundPacket = tmp;
+        ESP_LOGI(__func__, "backBuffer size = %u\n", backBuffer->payloadSize);
+        copy_back_buffer_to_active_buffer();
+    
+        assert(backBuffer->payloadSize == 0);
+        assert(backBuffer->payloadStart == 0);
+
+        isFirstBufSwap = false;
 
         // Signal to the playback task that new data is available
         xTaskNotifyGiveIndexed(playbackTaskHandle, dataReadyNotifyIndex);
     }
 
     // We should only be here if the client got disconnected
-    gState = WAIT_FOR_CLIENT;
 
     return ESP_OK;
 }
@@ -552,11 +665,8 @@ void playback_task(void* pvParameters)
     while (receiveTaskHandle == NULL)
     {
         ESP_LOGI(TAG, "%s Waiting for receive task to come up\n", __func__);
-        vTaskDelay(500);
+        vTaskDelay(pdMS_TO_TICKS(5));
     }
-
-    // Let the receive task collect some data
-    vTaskDelay(20);
 
     bool error = false;
     while (!error)
@@ -566,18 +676,36 @@ void playback_task(void* pvParameters)
         xTaskNotifyGiveIndexed(receiveTaskHandle, playbackDoneNotifyIndex);
 
         // Wait for new data
-        PRINTF_DEBUG((TAG, "%s Waiting for new data\n", __func__));
         while (!ulTaskNotifyTakeIndexed(dataReadyNotifyIndex, pdTRUE, pdMS_TO_TICKS(1000)))
         {
             vTaskDelay(1);
         }
 
-        PRINTF_DEBUG((TAG, "%s Got data ready notification\n", __func__));
+        PRINTF_DEBUG((__func__, "Got data ready notification.\n"));
 
-        // Process active buffer (ESP32 has an asynchronous DMA for streaming audio data to a DAC)
-        PRINTF_DEBUG((TAG, "%s Processing active buffer (%u bytes)\n", __func__, activePacket->payloadSize));
-        vTaskDelay(MIN(pdMS_TO_TICKS(1), pdMS_TO_TICKS(MS_PER_SAMPLE * activePacket->payloadSize)));
+        // Verify the new data
+        if (activeBuffer->payloadSize < PLAYBACK_TASK_REQ_DATA_SIZE)
+        {
+            ESP_LOGE(__func__, "Received insufficient data from receive_task: %u / %u bytes\n",
+                activeBuffer->payloadSize, PLAYBACK_TASK_REQ_DATA_SIZE);
+            continue;
+        } 
+
+        // Convert data in active buffer (ESP32 has an asynchronous DMA for streaming audio data to a DAC)
+        //vTaskDelay(pdMS_TO_TICKS(MS_PER_SAMPLE * PLAYBACK_TASK_REQ_DATA_SIZE));
+    
+        PRINTF_DEBUG((__func__, "BEFORE: active payload start = %u, size = %u\n", 
+            activeBuffer->payloadStart, activeBuffer->payloadSize));
+
+        activeBuffer->payloadSize -= PLAYBACK_TASK_REQ_DATA_SIZE;
+        activeBuffer->payloadStart  = (activeBuffer->payloadStart + PLAYBACK_TASK_REQ_DATA_SIZE) % SHARED_BUFFER_LEN;
+
+        PRINTF_DEBUG((__func__, "AFTER: active payload start = %u, size = %u\n", 
+            activeBuffer->payloadStart, activeBuffer->payloadSize));
     }
+
+    ESP_LOGE(__func__, "An unrecoverable error occurred. Killing task...\n");
+    vTaskDelete(NULL);
 }
 
 
@@ -591,11 +719,11 @@ void app_main(void)
     ESP_LOGI(TAG, "%s LWIP config'd\n", __func__);
     #endif
 
-    activePacket = &gAudioPackets[0];
-    backgroundPacket = &gAudioPackets[1];
+    activeBuffer = &gSharedBuffer[0];
+    backBuffer = &gSharedBuffer[1];
 
-    memset(activePacket, 0, sizeof(struct AudioPacket_t));
-    memset(backgroundPacket, 0, sizeof(struct AudioPacket_t));
+    memset(activeBuffer, 0, sizeof(struct SharedBuffer_t));
+    memset(backBuffer, 0, sizeof(struct SharedBuffer_t));
 
     // Create "receive" and "playback" tasks
     //
