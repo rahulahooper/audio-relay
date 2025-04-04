@@ -517,18 +517,28 @@ esp_err_t stream_from_client(const int sock)
             }
 
             // Check if a packet was duplicated or dropped 
-            if (expectedSeqnum > recvPacket.seqnum)
-            {
-                // Client sent a packet that the server has already seen
-                ESP_LOGI(__func__, "SERVER AHEAD: expected seqnum %u, received packet seqnum %u\n",
-                    expectedSeqnum, recvPacket.seqnum);
-            }
-            else if (expectedSeqnum < recvPacket.seqnum)
+            if (expectedSeqnum < recvPacket.seqnum)
             {
                 // A packet got dropped in transit
                 ESP_LOGI(__func__, "SERVER BEHIND: expected seqnum %u, received packet seqnum %u\n",
                     expectedSeqnum, recvPacket.seqnum);
                 expectedSeqnum = recvPacket.seqnum + 1;
+            }
+            else if (expectedSeqnum > recvPacket.seqnum)
+            {
+                if (expectedSeqnum - recvPacket.seqnum > UINT16_MAX / 2)
+                {
+                    // On the client size, the seqnum overflowed
+                    ESP_LOGI(__func__, "SERVER BEHIND / CLIENT WRAPPED: expected seqnum %u, received packet seqnum %u\n",
+                        expectedSeqnum, recvPacket.seqnum);
+                    expectedSeqnum = recvPacket.seqnum + 1;
+                }
+                else
+                {
+                    // Client sent a packet that the server has already seen
+                    ESP_LOGI(__func__, "SERVER AHEAD: expected seqnum %u, received packet seqnum %u\n",
+                        expectedSeqnum, recvPacket.seqnum);
+                }
             }
             else
             {
@@ -568,11 +578,11 @@ esp_err_t stream_from_client(const int sock)
         }
 
         // At this point the playback task is blocked waiting for new data. 
-        ESP_LOGI(__func__, "backBuffer size = %u\n", backBuffer->payloadSize);
         copy_back_buffer_to_active_buffer();
     
         assert(backBuffer->payloadSize == 0);
         assert(backBuffer->payloadStart == 0);
+        assert(activeBuffer->payloadStart == 0);
 
         isFirstBufSwap = false;
 
@@ -690,18 +700,30 @@ void playback_task(void* pvParameters)
                 activeBuffer->payloadSize, PLAYBACK_TASK_REQ_DATA_SIZE);
             continue;
         } 
+        else if (activeBuffer->payloadStart != 0)
+        {
+            ESP_LOGE(__func__, "active buffer data doesn't start at idx 0 (%u). Not playing data\n",
+                activeBuffer->payloadStart);
+            activeBuffer->payloadSize = 0;
+            activeBuffer->payloadStart = 0;
+            continue;
+        }
+
 
         // Convert data in active buffer (ESP32 has an asynchronous DMA for streaming audio data to a DAC)
-        //vTaskDelay(pdMS_TO_TICKS(MS_PER_SAMPLE * PLAYBACK_TASK_REQ_DATA_SIZE));
-    
-        PRINTF_DEBUG((__func__, "BEFORE: active payload start = %u, size = %u\n", 
-            activeBuffer->payloadStart, activeBuffer->payloadSize));
+        while (activeBuffer->payloadSize > PLAYBACK_TASK_REQ_DATA_SIZE)
+        {
+            vTaskDelay(pdMS_TO_TICKS(MS_PER_SAMPLE * PLAYBACK_TASK_REQ_DATA_SIZE));
+        
+            PRINTF_DEBUG((__func__, "BEFORE: active payload start = %u, size = %u\n", 
+                activeBuffer->payloadStart, activeBuffer->payloadSize));
 
-        activeBuffer->payloadSize -= PLAYBACK_TASK_REQ_DATA_SIZE;
-        activeBuffer->payloadStart  = (activeBuffer->payloadStart + PLAYBACK_TASK_REQ_DATA_SIZE) % SHARED_BUFFER_LEN;
+            activeBuffer->payloadSize -= PLAYBACK_TASK_REQ_DATA_SIZE;
+            activeBuffer->payloadStart  = (activeBuffer->payloadStart + PLAYBACK_TASK_REQ_DATA_SIZE) % SHARED_BUFFER_LEN;
 
-        PRINTF_DEBUG((__func__, "AFTER: active payload start = %u, size = %u\n", 
-            activeBuffer->payloadStart, activeBuffer->payloadSize));
+            PRINTF_DEBUG((__func__, "AFTER: active payload start = %u, size = %u\n", 
+                activeBuffer->payloadStart, activeBuffer->payloadSize));
+        }
     }
 
     ESP_LOGE(__func__, "An unrecoverable error occurred. Killing task...\n");
