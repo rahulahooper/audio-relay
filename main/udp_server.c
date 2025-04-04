@@ -341,7 +341,7 @@ esp_err_t setup_server(int addr_family, struct sockaddr_in* dest_addr, int* sock
 // Helper function for unwrapping received audio data and 
 // copying to the background buffer.
 ////////////////////////////////////////////////////////////////////
-void copy_recv_data_to_back_buffer(const AudioPacket_t* recvPacket, SharedBuffer_t* backBuffer)
+void copy_audio_packet_to_back_buffer(const AudioPacket_t* recvPacket, SharedBuffer_t* backBuffer)
 {
 
     assert(backBuffer->payloadStart == 0);
@@ -376,10 +376,11 @@ void copy_recv_data_to_back_buffer(const AudioPacket_t* recvPacket, SharedBuffer
 
     if (recvPacket->payloadStart != 0)
     {
-        ESP_LOGI(TAG, "%s recvPacket size = %u, start = %u, back buffer size = %u, first chunk = %lu, second chunk = %lu\n",
-            __func__, recvPacket->payloadSize, recvPacket->payloadStart, backBuffer->payloadSize, 
-            numBytesFirstChunk, numBytesSecondChunk);
+        ESP_LOGI(TAG, "%s recvPacket size = %u, seqnum = %u, start = %u, back buffer size = %u, first chunk = %lu, second chunk = %lu\n",
+            __func__, recvPacket->payloadSize, recvPacket->seqnum, recvPacket->payloadStart, 
+            backBuffer->payloadSize, numBytesFirstChunk, numBytesSecondChunk);
     }
+
     memcpy(&backBuffer->payload[backBuffer->payloadStart], &recvPacket->payload[recvPacket->payloadStart], numBytesFirstChunk);
     backBuffer->payloadSize += numBytesFirstChunk;
 
@@ -399,18 +400,22 @@ void copy_back_buffer_to_active_buffer()
 {
     assert(backBuffer->payloadStart == 0);
 
+    // if the active buffer is too full to accommodate the back buffer,
+    // clear the contents of the active buffer
     if (activeBuffer->payloadSize + backBuffer->payloadSize > SHARED_BUFFER_LEN)
     {
         ESP_LOGE(__func__, "back buffer too large to copy into active buffer, resetting active buffer");
         ESP_LOGE(__func__, "active buffer size = %u, back buffer size = %u, limit = %u\n",
             activeBuffer->payloadSize, backBuffer->payloadSize, SHARED_BUFFER_LEN);
 
-        memcpy(&activeBuffer->payload[0], &backBuffer->payload[backBuffer->payloadStart], backBuffer->payloadSize);
-        activeBuffer->payloadSize = backBuffer->payloadSize;
         activeBuffer->payloadStart = 0;
-        backBuffer->payloadSize = 0;
-        backBuffer->payloadStart = 0;
-        return;
+        activeBuffer->payloadSize = 0;
+        // memcpy(&activeBuffer->payload[0], &backBuffer->payload[backBuffer->payloadStart], backBuffer->payloadSize);
+        // activeBuffer->payloadSize = backBuffer->payloadSize;
+        // activeBuffer->payloadStart = 0;
+        // backBuffer->payloadSize = 0;
+        // backBuffer->payloadStart = 0;
+        // return;
     }
 
     // Move any leftover data in the active buffer to the beginning of the active buffer
@@ -429,6 +434,56 @@ void copy_back_buffer_to_active_buffer()
     PRINTF_DEBUG((__func__, "AFTER: active payload start = %u, size = %u, back buffer size = %u\n", 
         activeBuffer->payloadStart, activeBuffer->payloadSize, backBuffer->payloadSize));
 }
+
+
+////////////////////////////////////////////////////////////////////
+// validate_packet()
+//
+////////////////////////////////////////////////////////////////////
+void validate_audio_packet(AudioPacket_t* packet, uint16_t* expectedSeqnum, bool* isValid)
+{
+    uint16_t checksum = crc16(packet->payload, packet->payloadSize);
+
+    *isValid = (checksum == packet->checksum);
+
+    if (!(*isValid))
+    {
+        ESP_LOGE(TAG, "%s: Invalid checksum. Got 0x%x, expected 0x%x\n", __func__, checksum, packet->checksum);
+        ESP_LOGE(TAG, "%s: checksum 0x%x, seqnum %u, payload size %u\n", 
+            __func__, checksum, packet->seqnum, packet->payloadSize);
+        return;
+    }
+
+    // Check if a packet was duplicated or dropped 
+    if (*expectedSeqnum < packet->seqnum)
+    {
+        // A packet got dropped in transit
+        ESP_LOGI(__func__, "SERVER BEHIND: expected seqnum %u, received packet seqnum %u\n",
+            *expectedSeqnum, packet->seqnum);
+        *expectedSeqnum = packet->seqnum + 1;
+    }
+    else if (*expectedSeqnum > packet->seqnum)
+    {
+        if (*expectedSeqnum - packet->seqnum > UINT16_MAX / 2)
+        {
+            // On the client size, the seqnum overflowed
+            ESP_LOGI(__func__, "SERVER BEHIND / CLIENT WRAPPED: expected seqnum %u, received packet seqnum %u\n",
+                *expectedSeqnum, packet->seqnum);
+            *expectedSeqnum = packet->seqnum + 1;
+        }
+        else
+        {
+            // Client sent a packet that the server has already seen
+            ESP_LOGI(__func__, "SERVER AHEAD: expected seqnum %u, received packet seqnum %u\n",
+                *expectedSeqnum, packet->seqnum);
+        }
+    }
+    else
+    {
+        *expectedSeqnum += 1;
+    }
+}
+
 
 ////////////////////////////////////////////////////////////////////
 // stream_from_client()
@@ -506,50 +561,16 @@ esp_err_t stream_from_client(const int sock)
             get_system_time(&timerecv);
 
             // validate packet
-            uint16_t checksum = crc16(recvPacket.payload, recvPacket.payloadSize);
+            bool isValid = false;
+            validate_audio_packet(&recvPacket, &expectedSeqnum, &isValid);
 
-            if (checksum != recvPacket.checksum)
-            {
-                ESP_LOGE(TAG, "%s: Invalid checksum. Got 0x%x, expected 0x%x\n", __func__, checksum, recvPacket.checksum);
-                ESP_LOGE(TAG, "%s: checksum 0x%x, seqnum %u, payload size %u\n", 
-                    __func__, checksum, recvPacket.seqnum, recvPacket.payloadSize);
-                continue;
-            }
-
-            // Check if a packet was duplicated or dropped 
-            if (expectedSeqnum < recvPacket.seqnum)
-            {
-                // A packet got dropped in transit
-                ESP_LOGI(__func__, "SERVER BEHIND: expected seqnum %u, received packet seqnum %u\n",
-                    expectedSeqnum, recvPacket.seqnum);
-                expectedSeqnum = recvPacket.seqnum + 1;
-            }
-            else if (expectedSeqnum > recvPacket.seqnum)
-            {
-                if (expectedSeqnum - recvPacket.seqnum > UINT16_MAX / 2)
-                {
-                    // On the client size, the seqnum overflowed
-                    ESP_LOGI(__func__, "SERVER BEHIND / CLIENT WRAPPED: expected seqnum %u, received packet seqnum %u\n",
-                        expectedSeqnum, recvPacket.seqnum);
-                    expectedSeqnum = recvPacket.seqnum + 1;
-                }
-                else
-                {
-                    // Client sent a packet that the server has already seen
-                    ESP_LOGI(__func__, "SERVER AHEAD: expected seqnum %u, received packet seqnum %u\n",
-                        expectedSeqnum, recvPacket.seqnum);
-                }
-            }
-            else
-            {
-                expectedSeqnum++;
-            }
+            if (!isValid) continue;
 
             PRINTF_DEBUG((TAG, "%s: Successfully received packet with checksum 0x%x, seqnum %u, payload size %u\n", 
-                __func__, checksum, recvPacket.seqnum, recvPacket.payloadSize));
+                __func__, recvPacket.checksum, recvPacket.seqnum, recvPacket.payloadSize));
 
             // Copy into background buffer
-            copy_recv_data_to_back_buffer(&recvPacket, backBuffer);
+            copy_audio_packet_to_back_buffer(&recvPacket, backBuffer);
 
             PRINTF_DEBUG((TAG, "%s back buffer size = %u\n", __func__, backBuffer->payloadSize));
 
@@ -560,7 +581,7 @@ esp_err_t stream_from_client(const int sock)
             {
 
                 ESP_LOGI(TAG, "%s: Echoing back packet with checksum 0x%x, seqnum %u, payload size %u.\n", 
-                    __func__, checksum, recvPacket.seqnum, recvPacket.payloadSize);
+                    __func__, recvPacket.checksum, recvPacket.seqnum, recvPacket.payloadSize);
 
                 int err = sendto(sock, (void*)&recvPacket, sizeof(recvPacket), 0, (struct sockaddr*)&client_addr, sockaddr_len);
 
