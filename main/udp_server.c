@@ -445,11 +445,9 @@ void copy_back_buffer_to_active_buffer()
     }
 
     // Now there should be enough space to accommodate the back buffer
-
     assert((activeBuffer->numSamples + backBuffer->numSamples) <= SHARED_BUFFER_MAX_SAMPLES);
 
     // Move any leftover data in the active buffer to the beginning of the active buffer
-
     PRINTF_DEBUG((__func__, "BEFORE: active payload start = %u, size = %u, back buffer size = %u\n", 
         activeBuffer->payloadStart, activeBuffer->numSamples, backBuffer->numSamples));
 
@@ -459,19 +457,43 @@ void copy_back_buffer_to_active_buffer()
 
     activeBuffer->payloadStart = 0;
 
-    // Copy background buffer data into the active buffer, 
-    // zero-extending the data if necessary
+    // Copy background buffer data into the active buffer
+    // 
+    // If we are writing to the external DAC, the samples need to be
+    // resized to 32-bits. The 16-bit samples in the back buffer are 
+    // stored in big-endian format. However, the ESP32 stores data in 
+    // little-endian format. If we create a uint16_t pointer to the 
+    // back-buffer then dereference it, the bytes of the sample will 
+    // appear swapped. Therefore, if we want the MSB of our
+    // original sample, we must take the LSB of the dereferenced pointer.
 
     assert(backBuffer->sampleSizeBytes == sizeof(uint16_t));              // 2 bytes per sample
 
-    for (int i = 0; i < backBuffer->numSamples; i++)
+    // If we are writing to the external DAC, the samples need
+    // to be resized to 32-bit, big-endian.
+    if (activeBuffer->sampleSizeBytes == sizeof(uint32_t))
     {
-        uint8_t* dst = &activeBuffer->payload[activeBuffer->numSamples + i * activeBuffer->sampleSizeBytes];
-        uint16_t* src = (uint16_t*)&backBuffer->payload[backBuffer->payloadStart + i * backBuffer->sampleSizeBytes];
+        for (int i = 0; i < backBuffer->numSamples; i++)
+        {
+            uint32_t* dst = (uint32_t*)&activeBuffer->payload[activeBuffer->numSamples + i * activeBuffer->sampleSizeBytes];
+            uint16_t src = *(uint16_t*)&backBuffer->payload[backBuffer->payloadStart + i * backBuffer->sampleSizeBytes];
 
-        memset(dst, 0, activeBuffer->sampleSizeBytes);       // this ensures that the active buffer samples are zero-extended 
-                                                             // if activeBuffer->sampleSizeBytes > backBuffer->sampleSizeBytes 
-        memcpy(dst, src, MIN(activeBuffer->sampleSizeBytes, backBuffer->sampleSizeBytes));
+            uint16_t tmp = (src << 8) | (src >> 8);
+            *dst = tmp << 16;
+        }
+    }
+
+    // If we are writing to the internal DAC, the samples need to be 
+    // resized to 8-bits. 
+    else if (activeBuffer->sampleSizeBytes == sizeof(uint8_t))
+    {
+        for (int i = 0; i < backBuffer->numSamples; i++)
+        {
+            uint8_t* dst = (uint8_t*)&activeBuffer->payload[activeBuffer->numSamples + i * activeBuffer->sampleSizeBytes];
+            uint16_t* src = (uint16_t*)&backBuffer->payload[backBuffer->payloadStart + i * backBuffer->sampleSizeBytes];
+
+            *dst = *src & 0xFF;
+        }
     }
 
     // memcpy(&activeBuffer->payload[activeBuffer->numSamples], &backBuffer->payload[backBuffer->payloadStart], backBuffer->numSamples);
@@ -571,18 +593,14 @@ esp_err_t stream_from_buffer(const uint8_t* buffer, const uint32_t bufferSize)
         for (int i = 0; i < PLAYBACK_TASK_DESIRED_SAMPLES; i++)
         {
             backBuffer->payload[2*i] = buffer[idx];
-            backBuffer->payload[2*i+1] = 0x0;
+            backBuffer->payload[2*i+1] = 0; 
             idx = (idx + 1) % bufferSize;
         }
 
         backBuffer->numSamples = PLAYBACK_TASK_DESIRED_SAMPLES;
 
         // Wait until the playback task signals that it is ready for new data
-
-        while(!ulTaskNotifyTakeIndexed(playbackDoneNotifyIndex, pdTRUE, 0))
-        {
-            vTaskDelay(pdMS_TO_TICKS(1));
-        }
+        while(!ulTaskNotifyTakeIndexed(playbackDoneNotifyIndex, pdTRUE, 10));
 
         // At this point the playback task is waiting for new data. 
         // Copy sample data into the active buffer
@@ -912,15 +930,9 @@ void setup_dac(QueueHandle_t* queue, dac_continuous_handle_t* dacHandle, const u
 // setup_i2s()
 //
 ////////////////////////////////////////////////////////////////////
-void setup_i2s(QueueHandle_t* queue, i2s_chan_handle_t* i2sHandle, const uint32_t sampleRate)
+void setup_i2s(i2s_chan_handle_t* i2sHandle, const uint32_t sampleRate)
 {
-    // Allocate resources for queue
-
-    *queue = xQueueCreate(10, sizeof(i2s_event_data_t));
-    assert(*queue);
-
     // Configure the I2S channel
-
     i2s_chan_config_t i2sChanConfig = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
 
     i2s_new_channel(&i2sChanConfig, i2sHandle, NULL);
@@ -952,9 +964,9 @@ void setup_i2s(QueueHandle_t* queue, i2s_chan_handle_t* i2sHandle, const uint32_
         .gpio_cfg = 
         {
             .mclk = GPIO_NUM_0,
-            .bclk = GPIO_NUM_13,
+            .bclk = GPIO_NUM_16,
             .ws   = GPIO_NUM_27,
-            .dout = GPIO_NUM_12,
+            .dout = GPIO_NUM_14,
             .din  = I2S_GPIO_UNUSED,
             .invert_flags =
             {
@@ -966,37 +978,40 @@ void setup_i2s(QueueHandle_t* queue, i2s_chan_handle_t* i2sHandle, const uint32_
         }
     };
 
-    // (Unclear if this is even necessary)
-    // Register an interrupt that will fire whenever the I2S has finished sending all data to the DMA buffer
-
-    // i2s_event_callbacks_t i2sCallbacks;
-    // memset(&i2sCallbacks, 0, sizeof(i2sCallbacks));
-    // i2sCallbacks.on_sent = i2s_on_sent_callback;
-    // i2s_channel_register_event_callback(i2sHandle, &i2sCallbacks, queue);
-
-    // Initialize and start the channel
-
+    // Initialize and enable the channel
     i2s_channel_init_std_mode(*i2sHandle, &i2sStdConfig);
     i2s_channel_enable(*i2sHandle);         
 
     // The I2S is now running and sending data to the PCM1753
+
 }
 
 ////////////////////////////////////////////////////////////////////
 // destroy_dac()
 //
 ////////////////////////////////////////////////////////////////////
-void destroy_dac(dac_continuous_handle_t handle, QueueHandle_t queue)
+void destroy_dac(bool useExternalDac, dac_continuous_handle_t* dacHandle, 
+                 QueueHandle_t* dacQueue, i2s_chan_handle_t* i2sHandle)
 {
-    ESP_LOGI(__func__, "Not implemented yet\n");
+    if (useExternalDac)
+    {
+        // Stop i2s channel
+        ESP_ERROR_CHECK(i2s_channel_disable(*i2sHandle));
 
-    // Stop dac conversions
+        // Delete i2s channel
+        ESP_ERROR_CHECK(i2s_del_channel(*i2sHandle));
+    }
+    else
+    {
+        // Stop dac conversions
+        ESP_ERROR_CHECK(dac_continuous_disable(*dacHandle));
 
-    // Flush out the dac queue
+        // Free dac resources
+        ESP_ERROR_CHECK(dac_continuous_del_channels(*dacHandle));
 
-    // Free dac resources
-
-    // Free queue resouces
+        // Free queue resouces
+        vQueueDelete(*dacQueue);
+    }
 }
 
 
@@ -1015,14 +1030,13 @@ void playback_task_main(void* pvParameters)
     }
 
     // Setup the digital-to-analog converter (dac)
-
     QueueHandle_t dacQueue;                 // shared between intenal and external DACs
     dac_continuous_handle_t dacHandle;      // handle for internal DAC
     i2s_chan_handle_t i2sHandle;            // handle for external DAC (PCM1753)
 
     if (playbackTaskConfig.useExternalDac)
     {
-        setup_i2s(&dacQueue, &i2sHandle, playbackTaskConfig.sampleRate);
+        setup_i2s(&i2sHandle, playbackTaskConfig.sampleRate);
     }
     else
     {
@@ -1034,12 +1048,10 @@ void playback_task_main(void* pvParameters)
     while (!error)
     {
         // Notify the receive task that we are waiting for new data
-
-        PRINTF_DEBUG((TAG, "%s Notifying receive task of playback done\n", __func__));
+        PRINTF_DEBUG((__func__, "%s Notifying receive task of playback done\n"));
         xTaskNotifyGiveIndexed(receiveTaskHandle, playbackDoneNotifyIndex);
 
         // Wait for new data
-
         while (!ulTaskNotifyTakeIndexed(dataReadyNotifyIndex, pdTRUE, pdMS_TO_TICKS(1000)))
         {
             vTaskDelay(1);
@@ -1067,41 +1079,33 @@ void playback_task_main(void* pvParameters)
         }
 
         // Send data from active buffer to DAC
-
         if (playbackTaskConfig.useExternalDac)
         {
             i2s_event_data_t eventData;
             (void)eventData;
-            assert(activeBuffer->sampleSizeBytes == 3 * sizeof(uint8_t));
+            assert(activeBuffer->sampleSizeBytes == sizeof(uint32_t));
 
             while (activeBuffer->numSamples > PLAYBACK_TASK_REQ_SAMPLES)
             {
-                // xQueueReceive(dacQueue, &eventData, portMAX_DELAY);
-                // size_t loadedBytes = 0;
-                
-                // // copy data into the i2s tx dma buffer
-                // memcpy(eventData.dma_buf, activeBuffer + activeBuffer->payloadStart, eventData.size);
-                // activeBuffer->payloadStart += MIN(loadedBytes, activeBuffer->numSamples);
-                // activeBuffer->numSamples  -= MIN(loadedBytes, activeBuffer->numSamples);
-
                 size_t bytesWritten;
                 uint32_t timeoutMs = 1;
 
-                i2s_channel_write(i2sHandle, activeBuffer + activeBuffer->payloadStart, activeBuffer->numSamples, &bytesWritten, timeoutMs);
+                i2s_channel_write(i2sHandle, 
+                                  activeBuffer->payload + activeBuffer->payloadStart, 
+                                  activeBuffer->numSamples * activeBuffer->sampleSizeBytes, 
+                                  &bytesWritten, timeoutMs);
                 activeBuffer->payloadStart += bytesWritten;
-                activeBuffer->numSamples  -= bytesWritten / 3;
+                activeBuffer->numSamples  -= bytesWritten / 4;
             }
         }
         else
         {
             // Use the internal ESP32 DAC
-
             dac_event_data_t eventData;
             assert(activeBuffer->sampleSizeBytes == sizeof(uint8_t));
 
             while (activeBuffer->numSamples > PLAYBACK_TASK_REQ_SAMPLES)
             {
-                // ESP_LOGI(__func__, "%u\n", activeBuffer->payload[activeBuffer->payloadStart]);
                 xQueueReceive(dacQueue, &eventData, portMAX_DELAY);
                 size_t loadedBytes = 0;
                 ESP_ERROR_CHECK(dac_continuous_write_asynchronously(dacHandle, eventData.buf, eventData.buf_size,
@@ -1116,8 +1120,7 @@ void playback_task_main(void* pvParameters)
     }
 
     // We should never reach here
-
-    destroy_dac(dacHandle, dacQueue);
+    destroy_dac(playbackTaskConfig.useExternalDac, &dacHandle, &dacQueue, &i2sHandle);
     vTaskDelete(NULL);
 }
 
@@ -1128,19 +1131,17 @@ void playback_task_main(void* pvParameters)
 void init_shared_buffers(bool useExternalDac)
 {
     // Initialize the active buffer
-
     activeBuffer = &gSharedBuffer[0];
     activeBuffer->payloadStart = 0;
     activeBuffer->numSamples = 0;
 
-    // The external dac requires 24-bit samples, the internal dac requires 8-bit samples
-    activeBuffer->sampleSizeBytes = useExternalDac ? 3 * sizeof(uint8_t) : sizeof(uint8_t);
+    // The external dac requires 32-bit samples, the internal dac requires 8-bit samples
+    activeBuffer->sampleSizeBytes = useExternalDac ? sizeof(uint32_t) : sizeof(uint8_t);
 
     activeBuffer->payload = (uint8_t*)malloc(SHARED_BUFFER_MAX_SAMPLES * activeBuffer->sampleSizeBytes);
     memset(activeBuffer->payload, 0, SHARED_BUFFER_MAX_SAMPLES * activeBuffer->sampleSizeBytes);
 
     // Initialize the back buffer
-
     backBuffer = &gSharedBuffer[1];
     backBuffer->payloadStart = 0;
     backBuffer->numSamples = 0;
@@ -1167,7 +1168,7 @@ void app_main(void)
     ESP_LOGI(TAG, "%s LWIP config'd\n", __func__);
     #endif
 
-    bool useExternalDac = false;
+    bool useExternalDac = true;
 
     init_shared_buffers(useExternalDac);
 
@@ -1213,7 +1214,7 @@ void app_main(void)
 
     if (playbackTaskStatus != pdPASS)
     {
-        ESP_LOGE(TAG, "%s Failed to create transmit task!\n", __func__);
+        ESP_LOGE(TAG, "%s Failed to create playback task!\n", __func__);
         return;
     }
 
