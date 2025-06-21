@@ -907,26 +907,6 @@ void setup_dac(QueueHandle_t* queue, dac_continuous_handle_t* dacHandle, const u
 
 
 ////////////////////////////////////////////////////////////////////
-// i2s_on_sent_callback()
-//
-////////////////////////////////////////////////////////////////////
-// static bool IRAM_ATTR i2s_on_sent_callback(i2s_chan_handle_t i2sHandle, i2s_event_data_t* event, void* user_ctx)
-// {
-//     QueueHandle_t que = (QueueHandle_t)user_ctx;
-//     BaseType_t need_awoke;
-
-//     /* When the queue is full, drop the oldest item */
-//     if (xQueueIsQueueFullFromISR(que)) {
-//         i2s_event_data_t dummy;
-//         xQueueReceiveFromISR(que, &dummy, &need_awoke);
-//     }
-
-//     /* Send the event from callback */
-//     xQueueSendFromISR(que, event, &need_awoke);
-//     return need_awoke;
-// }
-
-////////////////////////////////////////////////////////////////////
 // setup_i2s()
 //
 ////////////////////////////////////////////////////////////////////
