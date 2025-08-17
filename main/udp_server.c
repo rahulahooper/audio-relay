@@ -49,7 +49,9 @@
 
 #define ESP_CORE_0      0       // physical core 0
 #define ESP_CORE_1      1       // physical core 1
-#define AUDIO_PACKET_MAX_SAMPLES 996     // maximum amount of audio data we can receive from client at a time
+
+#define AUDIO_PACKET_MAX_SAMPLES 250                   // maximum amount of audio data we can receive from client at a time
+#define AUDIO_PACKET_BYTES_PER_SAMPLE 3                // size of each sample within an audio packet in bytes
 
 // #define DEBUG
 #ifdef DEBUG
@@ -93,7 +95,7 @@ typedef struct AudioPacket_t
     uint16_t numSamples;            // number of 16-bit samples in payload
     uint16_t payloadStart;
     uint16_t checksum;              // crc-16
-    uint16_t payload[AUDIO_PACKET_MAX_SAMPLES];
+    uint8_t  payload[AUDIO_PACKET_MAX_SAMPLES];
 } AudioPacket_t;
 
 static const char *TAG = "wifi_ap";
@@ -353,25 +355,24 @@ esp_err_t setup_server(int addr_family, struct sockaddr_in* dest_addr, int* sock
 //
 // Helper function for unwrapping received audio data and 
 // copying to the background buffer.
+//
+// TODO: The client will already provide unwrapped audio data
+//      so much of the unwrapping functionality here in unneeded.
 ////////////////////////////////////////////////////////////////////
-void copy_audio_packet_to_back_buffer(const AudioPacket_t* recvPacket, SharedBuffer* backBuffer)
+void copy_audio_packet_to_back_buffer(const AudioPacket_t* audioPacket, SharedBuffer* backBuffer)
 {
-    // The back buffer and received audio packet should both hold 16-bit audio data,
-    // so no need to zero-extend or truncate the payload samples
-    assert(backBuffer->sampleSizeBytes == sizeof(recvPacket->payload[0])); 
-
     assert(backBuffer->payloadStart == 0);
+    assert(audioPacket->payloadStart == 0);
 
-    // The back buffer should be able to store all the data in the received audio packet
-    // assert(recvPacket->numSamples < SHARED_BUFFER_MAX_SAMPLES);
+    assert(audioPacket->numSamples < SHARED_BUFFER_MAX_SAMPLES);
 
     // Packets sent by the client should be aligned to 2-byte (16-bit) boundary
-    assert((recvPacket->payloadStart & 0x1) == 0);
+    assert((audioPacket->payloadStart & 0x1) == 0);
 
-    // Clear out the background buffer if the recvPacket will cause it to overflow
+    // Clear out the background buffer if the audioPacket will cause it to overflow
     // This shouldn't technically be possible since the playback task should drain 
     // this buffer long before it overflows
-    if (recvPacket->numSamples + backBuffer->numSamples >= SHARED_BUFFER_MAX_SAMPLES)
+    if (audioPacket->numSamples + backBuffer->numSamples >= SHARED_BUFFER_MAX_SAMPLES)
     {
         ESP_LOGI(TAG, "%s background buffer would overflow. Clearing buffer.\n", __func__);
         backBuffer->numSamples = 0;
@@ -379,8 +380,8 @@ void copy_audio_packet_to_back_buffer(const AudioPacket_t* recvPacket, SharedBuf
     }
 
     // The recvpacket payload may have overflowed on the client-side. If this happens, the 
-    // first audio sample will start at a non-zero offset into recvPacket->payload, and the audio stream will 
-    // wrap around to the beginning of recvPacket->payload.
+    // first audio sample will start at a non-zero offset into audioPacket->payload, and the audio stream will 
+    // wrap around to the beginning of audioPacket->payload.
     //
     //         Normal Case:                              Wraparound case:
     //
@@ -392,26 +393,26 @@ void copy_audio_packet_to_back_buffer(const AudioPacket_t* recvPacket, SharedBuf
     //               of audio data                          second chunk      first chunk of
     //                                                      of packet         audio data
     //
-    uint32_t numSamplesFirstChunk = (recvPacket->payloadStart == 0) ? recvPacket->numSamples : ((AUDIO_PACKET_MAX_SAMPLES - recvPacket->payloadStart) >> 1);
-    // uint32_t numSamplesFirstChunk = MIN((AUDIO_PACKET_MAX_SAMPLES - recvPacket->payloadStart) >> 1, recvPacket->numSamples);
-    uint32_t numSamplesSecondChunk = (recvPacket->payloadStart == 0) ? 0 : (recvPacket->numSamples - numSamplesFirstChunk);
+    uint32_t numSamplesFirstChunk = (audioPacket->payloadStart == 0) ? audioPacket->numSamples : ((AUDIO_PACKET_MAX_SAMPLES - audioPacket->payloadStart) >> 1);
+    // uint32_t numSamplesFirstChunk = MIN((AUDIO_PACKET_MAX_SAMPLES - audioPacket->payloadStart) >> 1, audioPacket->numSamples);
+    uint32_t numSamplesSecondChunk = (audioPacket->payloadStart == 0) ? 0 : (audioPacket->numSamples - numSamplesFirstChunk);
 
-    if (recvPacket->payloadStart != 0)
+    if (audioPacket->payloadStart != 0)
     {
-        ESP_LOGI(TAG, "%s recvPacket size = %u, seqnum = %u, start = %u, back buffer size = %u, first chunk = %lu, second chunk = %lu\n",
-            __func__, recvPacket->numSamples, recvPacket->seqnum, recvPacket->payloadStart, 
+        ESP_LOGI(TAG, "%s audioPacket size = %u, seqnum = %u, start = %u, back buffer size = %u, first chunk = %lu, second chunk = %lu\n",
+            __func__, audioPacket->numSamples, audioPacket->seqnum, audioPacket->payloadStart, 
             backBuffer->numSamples, numSamplesFirstChunk, numSamplesSecondChunk);
     }
 
     memcpy(&backBuffer->payload[backBuffer->numSamples * backBuffer->sampleSizeBytes],      // append to the existing samples in the back buffer
-            &recvPacket->payload[recvPacket->payloadStart],                                 // copy from wherever the data starts in the received audio packet
-            numSamplesFirstChunk * sizeof(uint16_t));                                       // copy the first chunk of data
+            &audioPacket->payload[audioPacket->payloadStart],                                 // copy from wherever the data starts in the received audio packet
+            numSamplesFirstChunk * AUDIO_PACKET_BYTES_PER_SAMPLE);                                       // copy the first chunk of data
 
     backBuffer->numSamples += numSamplesFirstChunk;
 
     memcpy(&backBuffer->payload[backBuffer->numSamples * backBuffer->sampleSizeBytes],      // append to the existing samples in the back buffer
-            &recvPacket->payload[0], 
-            numSamplesSecondChunk * sizeof(uint16_t));
+            &audioPacket->payload[0], 
+            numSamplesSecondChunk * AUDIO_PACKET_BYTES_PER_SAMPLE); 
 
     backBuffer->numSamples += numSamplesSecondChunk;
 
@@ -426,12 +427,11 @@ void copy_audio_packet_to_back_buffer(const AudioPacket_t* recvPacket, SharedBuf
 // copy_back_buffer_to_active_buffer()
 //
 // Transfers contents of back buffer to active buffer.
-// (the function name is kind of misleading)
+// (the function name is kind of misleading, since the 
+// data is *moved*, not just copied)
 ////////////////////////////////////////////////////////////////////
 void copy_back_buffer_to_active_buffer()
 {
-    assert(backBuffer->payloadStart == 0);
-
     // if the active buffer is too full to accommodate the back buffer,
     // clear the contents of the active buffer
     if ((activeBuffer->numSamples + backBuffer->numSamples) > SHARED_BUFFER_MAX_SAMPLES)
@@ -457,29 +457,27 @@ void copy_back_buffer_to_active_buffer()
 
     activeBuffer->payloadStart = 0;
 
+    assert(backBuffer->payloadStart == 0);
+
     // Copy background buffer data into the active buffer
-    // 
+
     // If we are writing to the external DAC, the samples need to be
-    // resized to 32-bits. The 16-bit samples in the back buffer are 
-    // stored in big-endian format. However, the ESP32 stores data in 
-    // little-endian format. If we create a uint16_t pointer to the 
-    // back-buffer then dereference it, the bytes of the sample will 
-    // appear swapped. Therefore, if we want the MSB of our
-    // original sample, we must take the LSB of the dereferenced pointer.
-
-    assert(backBuffer->sampleSizeBytes == sizeof(uint16_t));              // 2 bytes per sample
-
-    // If we are writing to the external DAC, the samples need
-    // to be resized to 32-bit, big-endian.
+    // resized to 32-bits. 
     if (activeBuffer->sampleSizeBytes == sizeof(uint32_t))
     {
+        uint padding = (activeBuffer->sampleSizeBytes - backBuffer->sampleSizeBytes);
+        assert(padding < activeBuffer->sampleSizeBytes);
+
         for (int i = 0; i < backBuffer->numSamples; i++)
         {
-            uint32_t* dst = (uint32_t*)&activeBuffer->payload[activeBuffer->numSamples + i * activeBuffer->sampleSizeBytes];
-            uint16_t src = *(uint16_t*)&backBuffer->payload[backBuffer->payloadStart + i * backBuffer->sampleSizeBytes];
+            uint activeBufferIdx = (activeBuffer->numSamples + i) * activeBuffer->sampleSizeBytes;
+            uint backBufferIdx   = i * backBuffer->sampleSizeBytes;
 
-            uint16_t tmp = (src << 8) | (src >> 8);
-            *dst = tmp << 16;
+            // zero out the current sample in the active buffer
+            memset(activeBuffer->payload + activeBufferIdx, 0, activeBuffer->sampleSizeBytes); 
+
+            // replace with the current sample in the back buffer
+            memcpy(activeBuffer->payload + activeBufferIdx + padding, backBuffer->payload + backBufferIdx, backBuffer->sampleSizeBytes);
         }
     }
 
@@ -490,13 +488,12 @@ void copy_back_buffer_to_active_buffer()
         for (int i = 0; i < backBuffer->numSamples; i++)
         {
             uint8_t* dst = (uint8_t*)&activeBuffer->payload[activeBuffer->numSamples + i * activeBuffer->sampleSizeBytes];
-            uint16_t* src = (uint16_t*)&backBuffer->payload[backBuffer->payloadStart + i * backBuffer->sampleSizeBytes];
+            uint16_t* src = (uint16_t*)&backBuffer->payload[i * backBuffer->sampleSizeBytes];
 
             *dst = *src & 0xFF;
         }
     }
 
-    // memcpy(&activeBuffer->payload[activeBuffer->numSamples], &backBuffer->payload[backBuffer->payloadStart], backBuffer->numSamples);
     activeBuffer->numSamples += backBuffer->numSamples;
 
     backBuffer->numSamples = 0;
@@ -508,45 +505,48 @@ void copy_back_buffer_to_active_buffer()
 
 
 ////////////////////////////////////////////////////////////////////
-// validate_packet()
+// validate_audio_packet()
 //
+// Verifies the CRC of an audio packet and checks
+// for any missed packets. 
 ////////////////////////////////////////////////////////////////////
-void validate_audio_packet(AudioPacket_t* packet, uint16_t* expectedSeqnum, bool* isValid)
+void validate_audio_packet(AudioPacket_t* audioPacket, uint16_t* expectedSeqnum, bool* isValid)
 {
-    uint16_t checksum = crc16((uint8_t*)packet->payload, packet->numSamples * sizeof(packet->payload[0]));
-
-    *isValid = (checksum == packet->checksum);
+    // verify the CRC of the audio packet
+    uint16_t checksum = crc16((uint8_t*)audioPacket->payload, audioPacket->numSamples * AUDIO_PACKET_BYTES_PER_SAMPLE);
+    bool     packetDoesNotWrap = (audioPacket->payloadStart == 0);
+    *isValid = (checksum == audioPacket->checksum) && packetDoesNotWrap;
 
     if (!(*isValid))
     {
-        ESP_LOGE(TAG, "%s: Invalid checksum. Got 0x%x, expected 0x%x\n", __func__, checksum, packet->checksum);
+        ESP_LOGE(TAG, "%s: Invalid checksum. Got 0x%x, expected 0x%x\n", __func__, checksum, audioPacket->checksum);
         ESP_LOGE(TAG, "%s: checksum 0x%x, seqnum %u, payload size %u\n", 
-            __func__, checksum, packet->seqnum, packet->numSamples);
+            __func__, checksum, audioPacket->seqnum, audioPacket->numSamples);
         return;
     }
 
     // Check if a packet was duplicated or dropped 
-    if (*expectedSeqnum < packet->seqnum)
+    if (*expectedSeqnum < audioPacket->seqnum)
     {
         // A packet got dropped in transit
         ESP_LOGI(__func__, "SERVER BEHIND: expected seqnum %u, received packet seqnum %u\n",
-            *expectedSeqnum, packet->seqnum);
-        *expectedSeqnum = packet->seqnum + 1;
+            *expectedSeqnum, audioPacket->seqnum);
+        *expectedSeqnum = audioPacket->seqnum + 1;
     }
-    else if (*expectedSeqnum > packet->seqnum)
+    else if (*expectedSeqnum > audioPacket->seqnum)
     {
-        if (*expectedSeqnum - packet->seqnum > UINT16_MAX / 2)
+        if (*expectedSeqnum - audioPacket->seqnum > UINT16_MAX / 2)
         {
             // On the client size, the seqnum overflowed
             ESP_LOGI(__func__, "SERVER BEHIND / CLIENT WRAPPED: expected seqnum %u, received packet seqnum %u\n",
-                *expectedSeqnum, packet->seqnum);
-            *expectedSeqnum = packet->seqnum + 1;
+                *expectedSeqnum, audioPacket->seqnum);
+            *expectedSeqnum = audioPacket->seqnum + 1;
         }
         else
         {
             // Client sent a packet that the server has already seen
             ESP_LOGI(__func__, "SERVER AHEAD: expected seqnum %u, received packet seqnum %u\n",
-                *expectedSeqnum, packet->seqnum);
+                *expectedSeqnum, audioPacket->seqnum);
             *isValid = false;
         }
     }
@@ -586,14 +586,25 @@ esp_err_t stream_from_buffer(const uint8_t* buffer, const uint32_t bufferSize)
     {
 
         // Copy sample data into background buffer, extending sample data 
-        // from 8-bits to 16-bits in the process
-
-        assert(backBuffer->sampleSizeBytes == sizeof(uint16_t));
+        // from 8-bits to 24-bits in the process (the playback task expects
+        // 24-bit audio samples);
+        
+        // Confirm that we aren't about to overflow the back buffer
+        assert(PLAYBACK_TASK_DESIRED_SAMPLES < SHARED_BUFFER_MAX_SAMPLES);
 
         for (int i = 0; i < PLAYBACK_TASK_DESIRED_SAMPLES; i++)
         {
-            backBuffer->payload[2*i] = buffer[idx];
-            backBuffer->payload[2*i+1] = 0; 
+            for (int j = 0; j < backBuffer->sampleSizeBytes; j++)
+            {
+                // On little-endian ESP32 systems, the 8-bit sample
+                // goes into the LSB of the 24-bit slot
+                //
+                //          Byte 0         Byte 1     Byte 2
+                //      [ 8-bit sample  |     0    |     0     ]
+                //
+                backBuffer->payload[2 * i + j] = (j == 0) ? buffer[idx] : 0;
+            }
+
             idx = (idx + 1) % bufferSize;
         }
 
@@ -606,7 +617,7 @@ esp_err_t stream_from_buffer(const uint8_t* buffer, const uint32_t bufferSize)
         // Copy sample data into the active buffer
         copy_back_buffer_to_active_buffer();
     
-        assert(backBuffer->numSamples == 0);       // background buffer should now be empty
+        assert(backBuffer->numSamples == 0);        // background buffer should now be empty
         assert(backBuffer->payloadStart == 0);      
         assert(activeBuffer->payloadStart == 0);    // data in active buffer should start at index 0
 
@@ -627,7 +638,7 @@ esp_err_t stream_from_client(const int sock, const int maxPacketTimeouts)
 {
     struct sockaddr_storage client_addr;
     socklen_t sockaddr_len = sizeof(client_addr);
-    struct AudioPacket_t recvPacket;
+    struct AudioPacket_t audioPacket;
 
     bool isFirstPacket = true;      // are we waiting on the first packet from the client?
     bool isFirstBufSwap = true;     // are we about to swap buffers with the playback task for the first time?
@@ -657,8 +668,8 @@ esp_err_t stream_from_client(const int sock, const int maxPacketTimeouts)
         {
             // try to receive a packet
 
-            memset(&recvPacket, 0, sizeof(recvPacket));
-            int len = recvfrom(sock, &recvPacket, sizeof(recvPacket), 0, (struct sockaddr*)&client_addr, &sockaddr_len);
+            memset(&audioPacket, 0, sizeof(audioPacket));
+            int len = recvfrom(sock, &audioPacket, sizeof(audioPacket), 0, (struct sockaddr*)&client_addr, &sockaddr_len);
 
             // check if we failed to receive the packet
             // if this occurs enough times, we assume the client got disconnected
@@ -699,7 +710,7 @@ esp_err_t stream_from_client(const int sock, const int maxPacketTimeouts)
 
             // validate packet crc
             bool isValid = false;
-            validate_audio_packet(&recvPacket, &expectedSeqnum, &isValid);
+            validate_audio_packet(&audioPacket, &expectedSeqnum, &isValid);
 
             if (!isValid) 
             {
@@ -708,23 +719,23 @@ esp_err_t stream_from_client(const int sock, const int maxPacketTimeouts)
             }
 
             PRINTF_DEBUG((TAG, "%s: Successfully received packet with checksum 0x%x, seqnum %u, payload size %u\n", 
-                __func__, recvPacket.checksum, recvPacket.seqnum, recvPacket.numSamples));
+                __func__, audioPacket.checksum, audioPacket.seqnum, audioPacket.numSamples));
 
             // Copy packet into the background buffer
-            copy_audio_packet_to_back_buffer(&recvPacket, backBuffer);
+            copy_audio_packet_to_back_buffer(&audioPacket, backBuffer);
 
             PRINTF_DEBUG((TAG, "%s back buffer size = %u\n", __func__, backBuffer->numSamples));
 
             // if the client requested it, echo the packet back
             // TODO: Defer this to immediately after we have 
             //       provided new data to the playback task
-            if (recvPacket.echo)
+            if (audioPacket.echo)
             {
 
                 ESP_LOGI(TAG, "%s: Echoing back packet with checksum 0x%x, seqnum %u, payload size %u.\n", 
-                    __func__, recvPacket.checksum, recvPacket.seqnum, recvPacket.numSamples);
+                    __func__, audioPacket.checksum, audioPacket.seqnum, audioPacket.numSamples);
 
-                int err = sendto(sock, (void*)&recvPacket, sizeof(recvPacket), 0, (struct sockaddr*)&client_addr, sockaddr_len);
+                int err = sendto(sock, (void*)&audioPacket, sizeof(audioPacket), 0, (struct sockaddr*)&client_addr, sockaddr_len);
 
                 if (err < 0)
                 {
@@ -793,18 +804,20 @@ static void receive_task_main(void *pvParameters)
         {
             case RECEIVE_TASK_STATE_SETUP_WIFI_DRIVER:
             {
+                ESP_LOGI(__func__, "RECEIVE_TASK_STATE_SETUP_WIFI_DRIVER\n");
                 wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
                 wifi_setup_driver(&cfg);
                 break;
             } 
             case RECEIVE_TASK_STATE_SETUP_SERVER:
             {
+                ESP_LOGI(__func__, "RECEIVE_TASK_STATE_SETUP_SERVER\n");
                 ESP_ERROR_CHECK( setup_server(addr_family, &dest_addr, &sock) );
                 break;
             }
             case RECEIVE_TASK_STATE_WAIT_FOR_CLIENT:
             {
-                ESP_LOGI(TAG, "%s Waiting for client to connect...\n", __func__);
+                ESP_LOGI(__func__, "RECEIVE_TASK_STATE_WAIT_FOR_CLIENT\n");
                 EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group, 
                                                     WIFI_EVENT_AP_STACONNECTED_BIT,
                                                     pdTRUE, 
@@ -952,7 +965,7 @@ void setup_i2s(i2s_chan_handle_t* i2sHandle, const uint32_t sampleRate)
             {
                 .bclk_inv = false,
                 .mclk_inv = false,
-                .ws_inv   = true,                       // The PCM1753 assets WS for the left channel and 
+                .ws_inv   = true,                       // The PCM1753 asserts WS for the left channel and 
                                                         //  de-asserts WS for the right channel
             }
         }
@@ -1075,7 +1088,7 @@ void playback_task_main(void* pvParameters)
                                   activeBuffer->numSamples * activeBuffer->sampleSizeBytes, 
                                   &bytesWritten, timeoutMs);
                 activeBuffer->payloadStart += bytesWritten;
-                activeBuffer->numSamples  -= bytesWritten / 4;
+                activeBuffer->numSamples  -= (bytesWritten >> 2);   // 1 sample = 4 bytes
             }
         }
         else
@@ -1126,8 +1139,8 @@ void init_shared_buffers(bool useExternalDac)
     backBuffer->payloadStart = 0;
     backBuffer->numSamples = 0;
 
-    // The samples we send over Wifi are 16-bit
-    backBuffer->sampleSizeBytes = sizeof(uint16_t);
+    // The samples we send over Wifi are 24-bit
+    backBuffer->sampleSizeBytes = AUDIO_PACKET_BYTES_PER_SAMPLE;
 
     backBuffer->payload = (uint8_t*)malloc(SHARED_BUFFER_MAX_SAMPLES * backBuffer->sampleSizeBytes);
     memset(backBuffer->payload, 0, SHARED_BUFFER_MAX_SAMPLES * backBuffer->sampleSizeBytes);
@@ -1163,7 +1176,7 @@ void app_main(void)
     // that new data is available.
 
     ReceiveTaskConfig_t receiveTaskConfig = {
-        .streamFromBuffer = true,
+        .streamFromBuffer = false,
         .buffer           = audio_table_sawtooth,
         .bufferSize       = audio_table_sawtooth_size,
         .maxPacketTimeoutsPerConnection = 3, 
