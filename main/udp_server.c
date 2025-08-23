@@ -74,7 +74,7 @@ static ReceiveTaskState_t gReceiveTaskState;     // global state object
 typedef struct ReceiveTaskConfig_t
 {
     bool             streamFromBuffer;        // get from audio data from file
-    const uint8_t*   buffer;                  // buffer to get audio from (ignored if .streamFromBuffer is false)
+    const int32_t*   buffer;                  // buffer to get audio from (ignored if .streamFromBuffer is false)
     uint32_t         bufferSize;              // size of buffer
 
     uint8_t  maxPacketTimeoutsPerConnection;        // number of timeouts before we assume the client disconnected
@@ -353,17 +353,13 @@ esp_err_t setup_server(int addr_family, struct sockaddr_in* dest_addr, int* sock
 ////////////////////////////////////////////////////////////////////
 // copy_to_back_buffer()
 //
-// Helper function for unwrapping received audio data and 
-// copying to the background buffer.
-//
-// TODO: The client will already provide unwrapped audio data
-//      so much of the unwrapping functionality here in unneeded.
+// Helper function for copying received audio data
+// to the background buffer.
 ////////////////////////////////////////////////////////////////////
 void copy_audio_packet_to_back_buffer(const AudioPacket_t* audioPacket, SharedBuffer* backBuffer)
 {
     assert(backBuffer->payloadStart == 0);
     assert(audioPacket->payloadStart == 0);
-
     assert(audioPacket->numSamples < SHARED_BUFFER_MAX_SAMPLES);
 
     // Packets sent by the client should be aligned to 2-byte (16-bit) boundary
@@ -379,42 +375,11 @@ void copy_audio_packet_to_back_buffer(const AudioPacket_t* audioPacket, SharedBu
         backBuffer->payloadStart = 0;
     }
 
-    // The recvpacket payload may have overflowed on the client-side. If this happens, the 
-    // first audio sample will start at a non-zero offset into audioPacket->payload, and the audio stream will 
-    // wrap around to the beginning of audioPacket->payload.
-    //
-    //         Normal Case:                              Wraparound case:
-    //
-    //            -----------------------------------     -----------------------------------
-    //            |          Payload Array          |     |          Payload Array          |
-    //            -----------------------------------     -----------------------------------
-    //            |<---------------->|                    |<------------->| |<-------------->|
-    //               ^ first and only chunk                        ^                 ^ 
-    //               of audio data                          second chunk      first chunk of
-    //                                                      of packet         audio data
-    //
-    uint32_t numSamplesFirstChunk = (audioPacket->payloadStart == 0) ? audioPacket->numSamples : ((AUDIO_PACKET_MAX_SAMPLES - audioPacket->payloadStart) >> 1);
-    // uint32_t numSamplesFirstChunk = MIN((AUDIO_PACKET_MAX_SAMPLES - audioPacket->payloadStart) >> 1, audioPacket->numSamples);
-    uint32_t numSamplesSecondChunk = (audioPacket->payloadStart == 0) ? 0 : (audioPacket->numSamples - numSamplesFirstChunk);
-
-    if (audioPacket->payloadStart != 0)
-    {
-        ESP_LOGI(TAG, "%s audioPacket size = %u, seqnum = %u, start = %u, back buffer size = %u, first chunk = %lu, second chunk = %lu\n",
-            __func__, audioPacket->numSamples, audioPacket->seqnum, audioPacket->payloadStart, 
-            backBuffer->numSamples, numSamplesFirstChunk, numSamplesSecondChunk);
-    }
-
     memcpy(&backBuffer->payload[backBuffer->numSamples * backBuffer->sampleSizeBytes],      // append to the existing samples in the back buffer
-            &audioPacket->payload[audioPacket->payloadStart],                                 // copy from wherever the data starts in the received audio packet
-            numSamplesFirstChunk * AUDIO_PACKET_BYTES_PER_SAMPLE);                                       // copy the first chunk of data
+            &audioPacket->payload[audioPacket->payloadStart],                               // copy from wherever the data starts in the received audio packet
+            audioPacket->numSamples * AUDIO_PACKET_BYTES_PER_SAMPLE);                       // copy all the samples in the received audio packet
 
-    backBuffer->numSamples += numSamplesFirstChunk;
-
-    memcpy(&backBuffer->payload[backBuffer->numSamples * backBuffer->sampleSizeBytes],      // append to the existing samples in the back buffer
-            &audioPacket->payload[0], 
-            numSamplesSecondChunk * AUDIO_PACKET_BYTES_PER_SAMPLE); 
-
-    backBuffer->numSamples += numSamplesSecondChunk;
+    backBuffer->numSamples += audioPacket->numSamples;
 
     // We've already confirmed this, but just to double check, 
     // ensure that the back buffer hasn't overflowed
@@ -563,7 +528,7 @@ void validate_audio_packet(AudioPacket_t* audioPacket, uint16_t* expectedSeqnum,
 // over Wifi, just stream data from a local buffer that lives on
 // this ESP32.
 ////////////////////////////////////////////////////////////////////
-esp_err_t stream_from_buffer(const uint8_t* buffer, const uint32_t bufferSize)
+esp_err_t stream_from_buffer(const int32_t* buffer, const uint32_t bufferSize)
 {
     // Wait for the playback task to come up
 
@@ -594,23 +559,15 @@ esp_err_t stream_from_buffer(const uint8_t* buffer, const uint32_t bufferSize)
 
         for (int i = 0; i < PLAYBACK_TASK_DESIRED_SAMPLES; i++)
         {
-            for (int j = 0; j < backBuffer->sampleSizeBytes; j++)
-            {
-                // On little-endian ESP32 systems, the 8-bit sample
-                // goes into the LSB of the 24-bit slot
-                //
-                //          Byte 0         Byte 1     Byte 2
-                //      [ 8-bit sample  |     0    |     0     ]
-                //
-                backBuffer->payload[2 * i + j] = (j == 0) ? buffer[idx] : 0;
-            }
+            // The ESP32 is little-endian. The memcpy below copies the 3 LSBs of the sample.
+            int32_t sample = buffer[idx];
+            memcpy(backBuffer->payload + i * backBuffer->sampleSizeBytes, &sample, backBuffer->sampleSizeBytes);
 
             idx = (idx + 1) % bufferSize;
         }
 
         backBuffer->numSamples = PLAYBACK_TASK_DESIRED_SAMPLES;
 
-        // Wait until the playback task signals that it is ready for new data
         while(!ulTaskNotifyTakeIndexed(playbackDoneNotifyIndex, pdTRUE, 10));
 
         // At this point the playback task is waiting for new data. 
@@ -843,7 +800,7 @@ static void receive_task_main(void *pvParameters)
             // for debug
             case RECEIVE_TASK_STATE_STREAM_FROM_BUFFER:
             {
-                const uint8_t* buffer = receiveTaskConfig.buffer;
+                const int32_t* buffer = receiveTaskConfig.buffer;
                 const uint32_t bufferSize = receiveTaskConfig.bufferSize;
 
                 assert(buffer != NULL);
@@ -923,20 +880,19 @@ void setup_dac(QueueHandle_t* queue, dac_continuous_handle_t* dacHandle, const u
 // setup_i2s()
 //
 ////////////////////////////////////////////////////////////////////
-void setup_i2s(i2s_chan_handle_t* i2sHandle, const uint32_t sampleRate)
+void setup_i2s(i2s_chan_handle_t* i2sHandle, i2s_chan_handle_t* i2sComHandle, const uint32_t sampleRate)
 {
     // Configure the I2S channel
-    i2s_chan_config_t i2sChanConfig = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
-
+    i2s_chan_config_t i2sChanConfig = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
     i2s_new_channel(&i2sChanConfig, i2sHandle, NULL);
 
     i2s_std_config_t i2sStdConfig = 
     {
         .clk_cfg = 
         {
-            .sample_rate_hz = sampleRate,
+            .sample_rate_hz = 48000, //sampleRate,
             .clk_src = I2S_CLK_SRC_DEFAULT,
-            .mclk_multiple = I2S_MCLK_MULTIPLE_384,
+            .mclk_multiple = I2S_MCLK_MULTIPLE_192,
         },
 
         .slot_cfg =
@@ -957,7 +913,7 @@ void setup_i2s(i2s_chan_handle_t* i2sHandle, const uint32_t sampleRate)
         .gpio_cfg = 
         {
             .mclk = GPIO_NUM_0,
-            .bclk = GPIO_NUM_16,
+            .bclk = GPIO_NUM_12,
             .ws   = GPIO_NUM_27,
             .dout = GPIO_NUM_14,
             .din  = I2S_GPIO_UNUSED,
@@ -971,12 +927,13 @@ void setup_i2s(i2s_chan_handle_t* i2sHandle, const uint32_t sampleRate)
         }
     };
 
-    // Initialize and enable the channel
+    // Initialize and enable the channels
     i2s_channel_init_std_mode(*i2sHandle, &i2sStdConfig);
     i2s_channel_enable(*i2sHandle);         
 
     // The I2S is now running and sending data to the PCM1753
 
+    vTaskDelay(100);
 }
 
 ////////////////////////////////////////////////////////////////////
@@ -1026,10 +983,10 @@ void playback_task_main(void* pvParameters)
     QueueHandle_t dacQueue;                 // shared between intenal and external DACs
     dac_continuous_handle_t dacHandle;      // handle for internal DAC
     i2s_chan_handle_t i2sHandle;            // handle for external DAC (PCM1753)
-
+    i2s_chan_handle_t i2sComHandle;
     if (playbackTaskConfig.useExternalDac)
     {
-        setup_i2s(&i2sHandle, playbackTaskConfig.sampleRate);
+        setup_i2s(&i2sHandle, &i2sComHandle, playbackTaskConfig.sampleRate);
     }
     else
     {
@@ -1176,9 +1133,9 @@ void app_main(void)
     // that new data is available.
 
     ReceiveTaskConfig_t receiveTaskConfig = {
-        .streamFromBuffer = false,
-        .buffer           = audio_table_sawtooth,
-        .bufferSize       = audio_table_sawtooth_size,
+        .streamFromBuffer = true,
+        .buffer           = audio_table_1khz,
+        .bufferSize       = audio_table_1khz_size,
         .maxPacketTimeoutsPerConnection = 3, 
     };
 
