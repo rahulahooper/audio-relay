@@ -81,12 +81,24 @@ typedef struct ReceiveTaskConfig_t
 
 } ReceiveTaskConfig_t;
 
+ReceiveTaskConfig_t receiveTaskConfig = {
+    .streamFromBuffer = true,
+    .buffer           = audio_table_1khz,
+    .bufferSize       = audio_table_1khz_size,
+    .maxPacketTimeoutsPerConnection = 3, 
+};
+
 typedef struct PlaybackTaskConfig_t
 {
     uint32_t sampleRate;            // sampling rate for digital-to-analog converter (Hz)
     bool     useExternalDac;        // if false, configures the ESP32 built-in DAC
     uint32_t dataBitWidth;          // number of bits per audio sample
 } PlaybackTaskConfig_t;
+
+PlaybackTaskConfig_t playbackTaskConfig = {
+    .sampleRate = 48000,
+    .useExternalDac = true,
+};
 
 typedef struct AudioPacket_t
 {
@@ -95,7 +107,7 @@ typedef struct AudioPacket_t
     uint16_t numSamples;            // number of 16-bit samples in payload
     uint16_t payloadStart;
     uint16_t checksum;              // crc-16
-    uint8_t  payload[AUDIO_PACKET_MAX_SAMPLES];
+    uint8_t  payload[AUDIO_PACKET_MAX_SAMPLES * AUDIO_PACKET_BYTES_PER_SAMPLE];
 } AudioPacket_t;
 
 static const char *TAG = "wifi_ap";
@@ -1118,9 +1130,7 @@ void app_main(void)
     ESP_LOGI(TAG, "%s LWIP config'd\n", __func__);
     #endif
 
-    bool useExternalDac = true;
-
-    init_shared_buffers(useExternalDac);
+    init_shared_buffers(playbackTaskConfig.useExternalDac);
 
     // Create "receive" task
     // 
@@ -1131,13 +1141,6 @@ void app_main(void)
     // At this point, the receive task moves data from the back
     // buffer to the front buffer and signals to the receive task
     // that new data is available.
-
-    ReceiveTaskConfig_t receiveTaskConfig = {
-        .streamFromBuffer = true,
-        .buffer           = audio_table_1khz,
-        .bufferSize       = audio_table_1khz_size,
-        .maxPacketTimeoutsPerConnection = 3, 
-    };
 
     BaseType_t receiveTaskStatus = xTaskCreatePinnedToCore(receive_task_main, "receive_task", 8192, &receiveTaskConfig, 5, &receiveTaskHandle, ESP_CORE_0);
 
@@ -1154,11 +1157,6 @@ void app_main(void)
     // the amplifier circuit. When it is out of data, the 
     // playback task will notify the receive task and block
     // until there is new data available.
-
-    PlaybackTaskConfig_t playbackTaskConfig = {
-        .sampleRate = 48000,
-        .useExternalDac = useExternalDac,
-    };
 
     BaseType_t playbackTaskStatus = xTaskCreatePinnedToCore(playback_task_main, "playback_task", 8192, &playbackTaskConfig, 5, &playbackTaskHandle, ESP_CORE_1);
 
