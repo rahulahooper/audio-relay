@@ -82,7 +82,7 @@ typedef struct ReceiveTaskConfig_t
 } ReceiveTaskConfig_t;
 
 ReceiveTaskConfig_t receiveTaskConfig = {
-    .streamFromBuffer = true,
+    .streamFromBuffer = false,
     .buffer           = audio_table_1khz,
     .bufferSize       = audio_table_1khz_size,
     .maxPacketTimeoutsPerConnection = 3, 
@@ -382,7 +382,8 @@ void copy_audio_packet_to_back_buffer(const AudioPacket_t* audioPacket, SharedBu
     // this buffer long before it overflows
     if (audioPacket->numSamples + backBuffer->numSamples >= SHARED_BUFFER_MAX_SAMPLES)
     {
-        ESP_LOGI(TAG, "%s background buffer would overflow. Clearing buffer.\n", __func__);
+        ESP_LOGI(__func__, "background buffer would overflow (%u + %u > %u). Clearing buffer.\n",
+            audioPacket->numSamples, backBuffer->numSamples, SHARED_BUFFER_MAX_SAMPLES);
         backBuffer->numSamples = 0;
         backBuffer->payloadStart = 0;
     }
@@ -490,15 +491,12 @@ void copy_back_buffer_to_active_buffer()
 void validate_audio_packet(AudioPacket_t* audioPacket, uint16_t* expectedSeqnum, bool* isValid)
 {
     // verify the CRC of the audio packet
-    uint16_t checksum = crc16((uint8_t*)audioPacket->payload, audioPacket->numSamples * AUDIO_PACKET_BYTES_PER_SAMPLE);
     bool     packetDoesNotWrap = (audioPacket->payloadStart == 0);
-    *isValid = (checksum == audioPacket->checksum) && packetDoesNotWrap;
+    *isValid = packetDoesNotWrap;
 
     if (!(*isValid))
     {
-        ESP_LOGE(TAG, "%s: Invalid checksum. Got 0x%x, expected 0x%x\n", __func__, checksum, audioPacket->checksum);
-        ESP_LOGE(TAG, "%s: checksum 0x%x, seqnum %u, payload size %u\n", 
-            __func__, checksum, audioPacket->seqnum, audioPacket->numSamples);
+        ESP_LOGE(__func__, "Invalid packet (seqnum = %u)\n", audioPacket->seqnum); 
         return;
     }
 
@@ -745,6 +743,7 @@ esp_err_t stream_from_client(const int sock, const int maxPacketTimeouts)
 static void receive_task_main(void *pvParameters)
 {
     ReceiveTaskConfig_t receiveTaskConfig = *(ReceiveTaskConfig_t*)pvParameters;
+    ESP_LOGI(__func__, "Receive task ready\n");
 
     int addr_family = AF_INET;
     struct sockaddr_in dest_addr;       // server IP address
@@ -802,6 +801,7 @@ static void receive_task_main(void *pvParameters)
             }
             case RECEIVE_TASK_STATE_RECEIVE_FROM_CLIENT:
             {
+                ESP_LOGI(__func__, "RECEIVE_TASK_STATE_RECEIVE_FROM_CLIENT\n");
                 // This only returns if a client disconnects
                 ESP_ERROR_CHECK(stream_from_client(sock, receiveTaskConfig.maxPacketTimeoutsPerConnection));
                 
@@ -812,6 +812,7 @@ static void receive_task_main(void *pvParameters)
             // for debug
             case RECEIVE_TASK_STATE_STREAM_FROM_BUFFER:
             {
+                ESP_LOGI(__func__, "RECEIVE_TASK_STATE_STREAM_FROM_BUFFER\n");
                 const int32_t* buffer = receiveTaskConfig.buffer;
                 const uint32_t bufferSize = receiveTaskConfig.bufferSize;
 
@@ -985,6 +986,7 @@ void playback_task_main(void* pvParameters)
 {
     PlaybackTaskConfig_t playbackTaskConfig = *(PlaybackTaskConfig_t*)pvParameters;
 
+    ESP_LOGI(TAG, "%s Playback task ready\n", __func__);
     while (receiveTaskHandle == NULL)
     {
         ESP_LOGI(TAG, "%s Waiting for receive task to come up\n", __func__);
