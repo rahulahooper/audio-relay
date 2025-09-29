@@ -119,7 +119,7 @@ static EventGroupHandle_t s_wifi_event_group;
 
 #define PLAYBACK_TASK_REQ_SAMPLES         AUDIO_PACKET_MAX_SAMPLES
 #define PLAYBACK_TASK_DESIRED_SAMPLES     (uint16_t)(PLAYBACK_TASK_REQ_SAMPLES * 1.5)
-#define SHARED_BUFFER_MAX_SAMPLES         (10 * AUDIO_PACKET_MAX_SAMPLES)     // SharedBuffer is guaranteed to be able to accommodate this many samples
+#define SHARED_BUFFER_MAX_SAMPLES         (12 * AUDIO_PACKET_MAX_SAMPLES)     // SharedBuffer is guaranteed to be able to accommodate this many samples
 
 typedef struct SharedBuffer
 {
