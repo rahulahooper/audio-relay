@@ -5,6 +5,10 @@
  */
 #include <stdio.h>
 
+// All the samples below were generated as 24-bit signed integers that were then sign-extended
+// to 32-bits. These integers can be converted back to their 24-bit representation with no loss
+// of information by removing the MSB, which is composed solely of sign bits. 
+
 int32_t audio_table_1khz[] = {
     0x0, 0x10b515, 0x2120fb, 0x30fbc5, 0x3fffff, 0x4debe4, 0x5a8279, 0x658c99, 0x6ed9eb, 0x7641ae, 0x7ba374, 
     0x7ee7a9, 0x7fffff, 0x7ee7a9, 0x7ba374, 0x7641ae, 0x6ed9eb, 0x658c99, 0x5a8279, 0x4debe4, 0x3fffff, 

@@ -84,8 +84,8 @@ typedef struct ReceiveTaskConfig_t
 
 static ReceiveTaskConfig_t receiveTaskConfig = {
     .streamFromBuffer = false,
-    .buffer           = audio_table_1khz,
-    .bufferSize       = audio_table_1khz_size,
+    .buffer           = audio_table_500hz,
+    .bufferSize       = audio_table_500hz_size,
     .maxPacketTimeoutsPerConnection = 3, 
 };
 
@@ -537,7 +537,9 @@ esp_err_t stream_from_buffer(const int32_t* buffer, const uint32_t bufferSize)
 
         for (int i = 0; i < PLAYBACK_TASK_DESIRED_SAMPLES; i++)
         {
-            // The ESP32 is little-endian. The memcpy below copies the 3 LSBs of the sample.
+            // The ESP32 is little-endian. The memcpy below copies the 3 LSBs of the sample,
+            // which is what we want, since the audio samples stored in the buffer are really
+            // 24-bit signed integers that have been sign-extended to 32-bits.
             int32_t sample = buffer[idx];
             memcpy(backBuffer->payload + i * backBuffer->sampleSizeBytes, &sample, backBuffer->sampleSizeBytes);
 
